@@ -130,7 +130,7 @@ class YandexSTTService(STTService):
     async def _connect(self):
         logger.debug(f"{self}: connecting to Yandex STT ({self._endpoint})")
 
-        creds = grpc.aio.ssl_channel_credentials()
+        creds = grpc.ssl_channel_credentials()
         self._channel = grpc.aio.secure_channel(self._endpoint, creds)
         stub = stt_service_pb2_grpc.RecognizerStub(self._channel)
 
