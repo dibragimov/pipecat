@@ -145,6 +145,7 @@ webrtc-video = [ "pipecat-ai[webrtc]" ]
 websocket = [ "fastapi>=0.115.6,<1" ]
 whisper = [ "faster-whisper~=1.2.1" ]
 xai = []
+yandex = ["yandexcloud>=0.320.0,<1"]
 
 # CLI tooling for `pipecat init` (not a service). Optional so the runtime/base-image
 # install stays lean; install with `pip install "pipecat-ai[cli]"`.

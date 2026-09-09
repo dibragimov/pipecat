@@ -1,0 +1,148 @@
+#
+# Copyright (c) 2024-2026, Beeline Uzbekistan
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+"""Yandex SpeechKit v1 text-to-speech service implementation.
+
+Uses the v1 REST synthesize endpoint requesting raw LPCM output directly,
+rather than the v3 gRPC streaming API - this avoids needing an Opus decoder
+in the pipeline, and REST proved simpler to validate(the v3 TTS gRPC
+stubs require generating protobuf bindings from Yandex's proto sources;
+REST does not).
+
+uz-UZ synthesis is not in Yandex's official documented voice list,
+but was confirmed working end to end during Phase 0 testing with
+default voice.
+"""
+
+from typing import AsyncGenerator, AsyncIterator, Optional
+
+import aiohttp
+from loguru import logger
+
+from pipecat.frames.frames import CancelFrame, EndFrame, ErrorFrame, Frame, StartFrame
+from pipecat.services.tts_service import TTSService
+from pipecat.transcriptions.language import Language
+
+LANGUAGE_MAP = {
+    Language.UZ: "uz-UZ",
+    Language.RU: "ru-RU",
+    Language.EN: "en-US",
+}
+
+# No documented Uzbek voice exists - omitting the voice param (None) lets
+# the API pick its own default.
+DEFAULT_VOICE = {
+    "ru-RU": "alena",
+    "en-US": "john",
+    "uz-UZ": None,
+}
+
+
+class YandexTTSService(TTSService):
+    """Text-to-speech using Yandex SpeechKit's v1 synthesize REST API.
+
+    Args:
+        api_key: Yandex Cloud API key (Authorization: Api-Key <key>).
+        folder_id: Yandex Cloud folder ID.
+        language: Synthesis language. One of Language.UZ, Language.RU,
+            Language.EN - extend LANGUAGE_MAP for others.
+        voice: Explicit voice name. If None, uses DEFAULT_VOICE for the
+            resolved language (and Yandex's own default for uz-UZ, since
+            no named voice is documented).
+        sample_rate: Output sample rate in Hz, requested directly from
+            Yandex via sampleRateHertz (no resampling needed downstream).
+        endpoint: Yandex TTS REST endpoint.
+        **kwargs: Additional arguments passed to TTSService.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        folder_id: str,
+        language: Language = Language.RU,
+        voice: Optional[str] = None,
+        sample_rate: int = 16000,
+        endpoint: str = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize",
+        **kwargs,
+    ):
+        super().__init__(sample_rate=sample_rate, **kwargs)
+        self._api_key = api_key
+        self._folder_id = folder_id
+        self._language = language
+        self._voice = voice
+        self._endpoint = endpoint
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    def language_to_service_language(self, language: Language) -> Optional[str]:
+        return LANGUAGE_MAP.get(language)
+
+    async def start(self, frame: StartFrame):
+        await super().start(frame)
+        self._session = aiohttp.ClientSession()
+
+    async def stop(self, frame: EndFrame):
+        await super().stop(frame)
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    async def cancel(self, frame: CancelFrame):
+        await super().cancel(frame)
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+    async def run_tts(
+        self, text: str, context_id: Optional[str] = None
+    ) -> AsyncGenerator[Frame, None]:
+        """Modeled directly on Piper's confirmed non-websocket TTS pattern:
+        start_tts_usage_metrics/stop_ttfb_metrics are called explicitly, but
+        TTSStartedFrame/TTSStoppedFrame are NOT yielded here - the base
+        class handles those automatically around this call.
+        """
+        lang_code = self.language_to_service_language(self._language) or "ru-RU"
+        voice = self._voice or DEFAULT_VOICE.get(lang_code)
+
+        data = {
+            "text": text,
+            "lang": lang_code,
+            "folderId": self._folder_id,
+            "format": "lpcm",
+            "sampleRateHertz": str(self.sample_rate),
+        }
+        if voice:
+            data["voice"] = voice
+        headers = {"Authorization": f"Api-Key {self._api_key}"}
+
+        logger.debug(f"{self}: Generating TTS [{text}]")
+
+        try:
+            await self.start_tts_usage_metrics(text)
+
+            async def audio_iterator() -> AsyncIterator[bytes]:
+                async with self._session.post(
+                    self._endpoint, headers=headers, data=data
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        raise RuntimeError(
+                            f"Yandex TTS error {resp.status}: {error_text}"
+                        )
+                    async for chunk in resp.content.iter_chunked(4096):
+                        if chunk:
+                            yield chunk
+
+            async for frame in self._stream_audio_frames_from_iterator(
+                audio_iterator(), in_sample_rate=self.sample_rate, context_id=context_id
+            ):
+                await self.stop_ttfb_metrics()
+                yield frame
+        except Exception as e:
+            logger.error(f"{self} exception: {e}")
+            yield ErrorFrame(error=f"Yandex TTS error: {e}")
+        finally:
+            logger.debug(f"{self}: Finished TTS [{text}]")
+            await self.stop_ttfb_metrics()
