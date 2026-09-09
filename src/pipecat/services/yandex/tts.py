@@ -22,6 +22,7 @@ import aiohttp
 from loguru import logger
 
 from pipecat.frames.frames import CancelFrame, EndFrame, ErrorFrame, Frame, StartFrame
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language
 
@@ -31,12 +32,17 @@ LANGUAGE_MAP = {
     Language.EN: "en-US",
 }
 
-# No documented Uzbek voice exists - omitting the voice param (None) lets
-# the API pick its own default.
+# nigora is the one uz-UZ voice confirmed compatible with the v1 REST API
+# this service uses (Yandex's current AI Studio docs, cross-checked
+# 2026-09-09: https://aistudio.yandex.ru/en/docs/speechkit/tts/voices).
+# Two other real uz-UZ voices exist - zamira and yulduz, both with role
+# variants (strict/friendly/whisper) - but both are v3-API-only. Using them
+# would mean implementing the v3 gRPC synthesis path instead of this REST
+# endpoint - a real follow-up, not something to bolt on here.
 DEFAULT_VOICE = {
     "ru-RU": "alena",
     "en-US": "john",
-    "uz-UZ": None,
+    "uz-UZ": "nigora",
 }
 
 
@@ -68,7 +74,11 @@ class YandexTTSService(TTSService):
         endpoint: str = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize",
         **kwargs,
     ):
-        super().__init__(sample_rate=sample_rate, **kwargs)
+        super().__init__(
+            sample_rate=sample_rate,
+            settings=TTSSettings(model="general", voice=voice, language=language),
+            **kwargs,
+        )
         self._api_key = api_key
         self._folder_id = folder_id
         self._language = language

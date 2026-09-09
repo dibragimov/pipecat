@@ -34,6 +34,7 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
@@ -83,7 +84,14 @@ class YandexSTTService(STTService):
         endpoint: str = "stt.api.cloud.yandex.net:443",
         **kwargs,
     ):
-        super().__init__(sample_rate=sample_rate, **kwargs)
+        # Populate settings explicitly - the base class logs a "NOT_GIVEN"
+        # warning (confirmed for the TTS side in production logs) if a
+        # subclass never passes these through.
+        super().__init__(
+            sample_rate=sample_rate,
+            settings=STTSettings(model="general", language=language),
+            **kwargs,
+        )
         self._api_key = api_key
         self._folder_id = folder_id
         self._language = language
