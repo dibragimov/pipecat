@@ -78,7 +78,7 @@ class YandexSTTService(STTService):
         *,
         api_key: str,
         folder_id: str,
-        language: Language = Language.RU,
+        language: str = "ru-RU",
         sample_rate: Optional[int] = None,
         endpoint: str = "stt.api.cloud.yandex.net:443",
         **kwargs,
@@ -129,7 +129,7 @@ class YandexSTTService(STTService):
         self._send_queue = asyncio.Queue()
         self._recv_queue = asyncio.Queue()
 
-        lang_code = self.language_to_service_language(self._language) or "ru-RU"
+        lang_code = self._language or "ru-RU"
         session_options = stt_pb2.StreamingRequest(
             session_options=stt_pb2.StreamingOptions(
                 recognition_model=stt_pb2.RecognitionModelOptions(

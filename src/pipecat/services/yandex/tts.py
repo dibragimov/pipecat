@@ -62,7 +62,7 @@ class YandexTTSService(TTSService):
         *,
         api_key: str,
         folder_id: str,
-        language: Language = Language.RU,
+        language: str = "ru-RU",
         voice: Optional[str] = None,
         sample_rate: int = 16000,
         endpoint: str = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize",
@@ -103,7 +103,7 @@ class YandexTTSService(TTSService):
         TTSStartedFrame/TTSStoppedFrame are NOT yielded here - the base
         class handles those automatically around this call.
         """
-        lang_code = self.language_to_service_language(self._language) or "ru-RU"
+        lang_code = self._language or "ru-RU"
         voice = self._voice or DEFAULT_VOICE.get(lang_code)
 
         data = {
