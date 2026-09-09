@@ -14,8 +14,15 @@ REST does not).
 uz-UZ synthesis is not in Yandex's official documented voice list,
 but was confirmed working end to end during Phase 0 testing with
 default voice.
+
+Per-utterance language detection (see _detect_utterance_language) picks a
+matching voice for each response text independently, rather than locking
+the whole call to one language/voice - a Russian-language voice reading
+an English sentence phonetically sounds as wrong as the reverse, so this
+runs on every run_tts() call rather than once at construction time.
 """
 
+import re
 from typing import AsyncGenerator, AsyncIterator, Optional
 
 import aiohttp
@@ -25,6 +32,53 @@ from pipecat.frames.frames import CancelFrame, EndFrame, ErrorFrame, Frame, Star
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language
+
+try:
+    from langdetect import DetectorFactory
+    from langdetect import detect as _langdetect_detect
+
+    DetectorFactory.seed = 0  # deterministic results across calls
+    _HAS_LANGDETECT = True
+except ImportError:
+    _HAS_LANGDETECT = False
+    logger.warning(
+        "langdetect not installed - per-utterance TTS language/voice "
+        "switching will fall back to the configured default language for "
+        "every utterance. Add `langdetect` to the yandex pyproject.toml "
+        "extra and the Dockerfile's install list to enable it."
+    )
+
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
+
+
+def _detect_utterance_language(text: str, default: str) -> str:
+    """Best-effort per-utterance language detection for picking a matching
+    Yandex voice. Falls back to `default` when the text is too short to
+    detect reliably, or when langdetect isn't installed.
+
+    Cyrillic is checked first and unconditionally - it's an unambiguous
+    signal for Russian in our language set, and Uzbek is overwhelmingly
+    written in Latin script today, so no separate library call is needed
+    for that case. Latin-script text goes through langdetect to
+    distinguish Uzbek from English, which script alone can't do.
+    """
+    stripped = text.strip()
+    if len(stripped) < 4:
+        return default
+
+    if _CYRILLIC_RE.search(stripped):
+        return "ru-RU"
+
+    if not _HAS_LANGDETECT:
+        return default
+
+    try:
+        code = _langdetect_detect(stripped)
+    except Exception:
+        return default
+
+    return {"uz": "uz-UZ", "en": "en-US", "ru": "ru-RU"}.get(code, default)
+
 
 LANGUAGE_MAP = {
     Language.UZ: "uz-UZ",
@@ -113,8 +167,16 @@ class YandexTTSService(TTSService):
         TTSStartedFrame/TTSStoppedFrame are NOT yielded here - the base
         class handles those automatically around this call.
         """
-        lang_code = self._language or "ru-RU"
-        voice = self._voice or DEFAULT_VOICE.get(lang_code)
+        configured_lang = self._language or "ru-RU"
+        lang_code = _detect_utterance_language(text, configured_lang)
+
+        # An explicit voice override only applies to the configured "home"
+        # language - otherwise a forced uz-UZ voice would speak detected
+        # English text phonetically, the exact problem this is fixing.
+        if lang_code == configured_lang and self._voice:
+            voice = self._voice
+        else:
+            voice = DEFAULT_VOICE.get(lang_code)
 
         data = {
             "text": text,
