@@ -59,6 +59,26 @@ LANGUAGE_MAP = {
     Language.EN: "en-US",
 }
 
+# The languages we want to auto-detect, per-utterance,
+# instead of locking the whole call to one.
+AUTO_DETECT_LANGUAGES = ["uz-UZ", "ru-RU", "en-US"]
+
+# Alternative languages[] entries use ISO 639-1.
+_ISO639_TO_LOCALE = {"uz": "uz-UZ", "ru": "ru-RU", "en": "en-US"}
+
+
+def _detected_language(alternative) -> Optional[str]:
+    """Best guess at which language this specific utterance was actually
+    spoken in, from Yandex's own per-utterance language distribution
+    (Alternative.languages[], confirmed field path). Returns None if the
+    field is empty or maps to a language outside AUTO_DETECT_LANGUAGES.
+    """
+    try:
+        best = max(alternative.languages, key=lambda entry: entry.probability)
+    except ValueError:
+        return None
+    return _ISO639_TO_LOCALE.get(best.language_code)
+
 
 class YandexSTTService(STTService):
     """Real-time speech-to-text using Yandex SpeechKit's v3 streaming API.
@@ -137,7 +157,6 @@ class YandexSTTService(STTService):
         self._send_queue = asyncio.Queue()
         self._recv_queue = asyncio.Queue()
 
-        lang_code = self._language or "ru-RU"
         session_options = stt_pb2.StreamingRequest(
             session_options=stt_pb2.StreamingOptions(
                 recognition_model=stt_pb2.RecognitionModelOptions(
@@ -150,7 +169,7 @@ class YandexSTTService(STTService):
                     ),
                     language_restriction=stt_pb2.LanguageRestrictionOptions(
                         restriction_type=stt_pb2.LanguageRestrictionOptions.WHITELIST,
-                        language_code=[lang_code],
+                        language_code=AUTO_DETECT_LANGUAGES,
                     ),
                     audio_processing_type=stt_pb2.RecognitionModelOptions.REAL_TIME,
                 )
@@ -193,37 +212,30 @@ class YandexSTTService(STTService):
             pass
 
     async def _handle_response(self, response):
-        """Field access here matches the shape confirmed during Phase 0
-        testing (partial / final, each with alternatives[0].text).
-
-        response.eou_update (Yandex's native end-of-turn signal) is not yet
-        consumed here - a good next step is surfacing it via
-        service_metadata_frame()/user_turn_strategies so Dograh's pipeline
-        can use Yandex's own turn detection instead of local VAD, the way
-        Soniox/AssemblyAI's native turn detection does. Left as a follow-up
-        rather than guessed at, since it touches turn-strategy wiring beyond
-        this file.
-        """
         if response.HasField("partial"):
             try:
-                text = response.partial.alternatives[0].text
+                alt = response.partial.alternatives[0]
+                text = alt.text
                 if text:
+                    lang = _detected_language(alt) or self._language
                     await self._recv_queue.put(
                         InterimTranscriptionFrame(
-                            text, self._user_id, time_now_iso8601(), self._language
+                            text, self._user_id, time_now_iso8601(), lang
                         )
                     )
             except (IndexError, AttributeError):
                 pass
         elif response.HasField("final"):
             try:
-                text = response.final.alternatives[0].text
+                alt = response.final.alternatives[0]
+                text = alt.text
                 if text:
+                    lang = _detected_language(alt) or self._language
                     self.request_finalize()
                     self.confirm_finalize()
                     await self._recv_queue.put(
                         TranscriptionFrame(
-                            text, self._user_id, time_now_iso8601(), self._language
+                            text, self._user_id, time_now_iso8601(), lang
                         )
                     )
             except (IndexError, AttributeError):
