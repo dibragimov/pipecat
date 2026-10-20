@@ -11,9 +11,8 @@ in the pipeline, and REST proved simpler to validate(the v3 TTS gRPC
 stubs require generating protobuf bindings from Yandex's proto sources;
 REST does not).
 
-uz-UZ synthesis is not in Yandex's official documented voice list,
-but was confirmed working end to end during Phase 0 testing with
-default voice.
+uz-UZ synthesis uses the nigora voice (see DEFAULT_VOICE), confirmed
+working end to end in live Web Calls.
 
 Per-utterance language detection (see _detect_utterance_language) picks a
 matching voice for each response text independently, rather than locking
@@ -35,49 +34,114 @@ from pipecat.transcriptions.language import Language
 
 try:
     from langdetect import DetectorFactory
-    from langdetect import detect as _langdetect_detect
+    from langdetect import detect_langs as _langdetect_detect_langs
 
     DetectorFactory.seed = 0  # deterministic results across calls
     _HAS_LANGDETECT = True
 except ImportError:
     _HAS_LANGDETECT = False
     logger.warning(
-        "langdetect not installed - per-utterance TTS language/voice "
-        "switching will fall back to the configured default language for "
-        "every utterance. Add `langdetect` to the yandex pyproject.toml "
-        "extra and the Dockerfile's install list to enable it."
+        "langdetect not installed - English text with no common English "
+        "words will be voiced as Uzbek. Add `langdetect` to the yandex "
+        "pyproject.toml extra and the Dockerfile's install list."
     )
 
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15, sock_connect=5)
+
 _CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
+# Letters of the Uzbek Cyrillic alphabet that Russian does not use.
+_UZ_CYRILLIC_RE = re.compile(r"[ЎўҚқҒғҲҳ]")
+# Every apostrophe-like character used for Uzbek oʻ/gʻ and the tutuq belgisi.
+_APOSTROPHES_RE = re.compile(r"[ʻʼ‘’`´]")
+_LATIN_WORD_RE = re.compile(r"[a-z']+")
+
+# Function words and stock call-center phrases. Words that are also real
+# Uzbek words are deliberately left out of the English list ("men", "on",
+# "it", "had", "or"), so a hit here is a genuine English signal.
+_EN_WORDS = frozenset("""
+    the an and is are was were be been to of in for with at by from this that
+    these those you your we our i me my he she they them their what which who
+    how why when where can could will would should do does did have has not
+    please thank thanks hello hi yes sorry help there here about if but just
+    okay ok hold call calling today
+    one moment good morning evening afternoon wait sure let look
+""".split())
+_UZ_WORDS = frozenset("""
+    va bu shu u men siz sizga sizni sizning biz bilan uchun emas bor yo'q ha
+    kerak mumkin iltimos rahmat assalomu alaykum salom qanday nima qaysi
+    qachon yana ham lekin agar bo'ladi bo'lsa edi endi hozir xizmat raqam
+    so'm mening ular o'z deb juda yaxshi keyin faqat hech narsa kechirasiz
+    tushundim xayr xush kelibsiz albatta tushunarli kuting bemalol
+""".split())
+
+
+def _is_uzbek_latin_word(word: str) -> bool:
+    """Spelling cues that English practically never produces: oʻ/gʻ followed
+    by a letter (but not the English possessive "dog's"), q not followed by
+    u, and the 2nd-person-polite suffix -ingiz."""
+    if word in _UZ_WORDS:
+        return True
+    if re.search(r"[og]'[a-z]", word) and not word.endswith("'s"):
+        return True
+    return bool(re.search(r"q(?!u)", word) or "ngiz" in word or word.startswith("x"))
 
 
 def _detect_utterance_language(text: str, default: str) -> str:
     """Best-effort per-utterance language detection for picking a matching
-    Yandex voice. Falls back to `default` when the text is too short to
-    detect reliably, or when langdetect isn't installed.
+    Yandex voice, among uz-UZ / ru-RU / en-US.
 
-    Cyrillic is checked first and unconditionally - it's an unambiguous
-    signal for Russian in our language set, and Uzbek is overwhelmingly
-    written in Latin script today, so no separate library call is needed
-    for that case. Latin-script text goes through langdetect to
-    distinguish Uzbek from English, which script alone can't do.
+    langdetect has no Uzbek model (it labels Uzbek as so/id/lt/it...), so it
+    cannot tell Uzbek from English on its own. Instead:
+      - Cyrillic with Uzbek-only letters (ў қ ғ ҳ) -> uz-UZ.
+      - Other text containing Cyrillic -> ru-RU, unless its Latin words are
+        clearly Uzbek (an Uzbek cue, or Latin letters > 2x Cyrillic):
+        "Sizga «Супер» tarifi mos keladi." -> uz-UZ, while
+        "Ваш тариф Beeline Smart." -> ru-RU. Cyrillic Uzbek without
+        ў қ ғ ҳ still goes to ru-RU, so the agent prompt should require Latin Uzbek.
+      - Latin -> en-US only with at least two English function words that
+        outnumber the Uzbek cues (or a one-word English reply), so
+        "OK, tushunarli." stays Uzbek. Domain words that are also loanwords in
+        Uzbek (balance, account, support...) are deliberately not English cues.
+        langdetect is consulted only for Latin text with no cues either way,
+        and only to confirm English.
+    Too-short text keeps `default`.
     """
     stripped = text.strip()
     if len(stripped) < 4:
         return default
 
     if _CYRILLIC_RE.search(stripped):
-        return "ru-RU"
+        if _UZ_CYRILLIC_RE.search(stripped):
+            return "uz-UZ"                      # Uzbek Cyrillic letters
+        latin_words = _LATIN_WORD_RE.findall(_APOSTROPHES_RE.sub("'", stripped.lower()))
+        cyr = len(_CYRILLIC_RE.findall(stripped))
+        lat = sum(len(w) for w in latin_words)
+        # Mixed script: Uzbek only if the Latin part is clearly Uzbek, e.g.
+        # "Sizga «Супер» tarifi mos keladi." -> uz; "Ваш тариф Beeline Smart." -> ru
+        if not latin_words or not (any(_is_uzbek_latin_word(w) for w in latin_words) or lat > 2 * cyr):
+            return "ru-RU"
 
-    if not _HAS_LANGDETECT:
-        return default
+    # Latin script: the choice is Uzbek or English.
+    latin_default = default if default in ("uz-UZ", "en-US") else "uz-UZ"
+    words = _LATIN_WORD_RE.findall(_APOSTROPHES_RE.sub("'", stripped.lower()))
+    if not words:
+        return latin_default
 
-    try:
-        code = _langdetect_detect(stripped)
-    except Exception:
-        return default
+    en_hits = sum(w in _EN_WORDS for w in words)
+    uz_hits = sum(_is_uzbek_latin_word(w) for w in words)
+    if en_hits > uz_hits and (en_hits >= 2 or len(words) == 1):
+        return "en-US"
+    if uz_hits:
+        return "uz-UZ"
 
-    return {"uz": "uz-UZ", "en": "en-US", "ru": "ru-RU"}.get(code, default)
+    if _HAS_LANGDETECT and len(stripped) >= 10:
+        try:
+            best = _langdetect_detect_langs(stripped)[0]
+            if best.lang == "en" and best.prob >= 0.95:
+                return "en-US"
+        except Exception:
+            pass
+    return latin_default
 
 
 LANGUAGE_MAP = {
@@ -108,9 +172,9 @@ class YandexTTSService(TTSService):
         folder_id: Yandex Cloud folder ID.
         language: Synthesis language. One of Language.UZ, Language.RU,
             Language.EN - extend LANGUAGE_MAP for others.
-        voice: Explicit voice name. If None, uses DEFAULT_VOICE for the
-            resolved language (and Yandex's own default for uz-UZ, since
-            no named voice is documented).
+        voice: Explicit voice name for the configured language. If None,
+            or when an utterance is detected in another language, uses
+            DEFAULT_VOICE for that language.
         sample_rate: Output sample rate in Hz, requested directly from
             Yandex via sampleRateHertz (no resampling needed downstream).
         endpoint: Yandex TTS REST endpoint.
@@ -145,7 +209,8 @@ class YandexTTSService(TTSService):
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
-        self._session = aiohttp.ClientSession()
+        # aiohttp's default total timeout is 5 minutes: a hung Yandex call would stall the turn.
+        self._session = aiohttp.ClientSession(timeout=HTTP_TIMEOUT)
 
     async def stop(self, frame: EndFrame):
         await super().stop(frame)
@@ -189,7 +254,8 @@ class YandexTTSService(TTSService):
             data["voice"] = voice
         headers = {"Authorization": f"Api-Key {self._api_key}"}
 
-        logger.debug(f"{self}: Generating TTS [{text}]")
+        # Never log the text itself: it can contain customer data.
+        logger.debug(f"{self}: Generating TTS ({lang_code}, {voice}, {len(text)} chars)")
 
         try:
             await self.start_tts_usage_metrics(text)
@@ -216,5 +282,5 @@ class YandexTTSService(TTSService):
             logger.error(f"{self} exception: {e}")
             yield ErrorFrame(error=f"Yandex TTS error: {e}")
         finally:
-            logger.debug(f"{self}: Finished TTS [{text}]")
+            logger.debug(f"{self}: Finished TTS ({lang_code}, {len(text)} chars)")
             await self.stop_ttfb_metrics()
