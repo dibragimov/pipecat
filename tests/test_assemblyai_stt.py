@@ -9,19 +9,55 @@
 import asyncio
 import io
 import json
+import unittest
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from loguru import logger
 
-from pipecat.frames.frames import UserStartedSpeakingFrame
+from pipecat.frames.frames import ProposedUserStartedSpeakingFrame
 from pipecat.services.assemblyai.stt import AssemblyAISTTService, is_u3_pro_model
 from pipecat.transcriptions.language import Language
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
+from pipecat.utils.asyncio.task_manager import TaskManager
+from tests.frame_processor_helpers import frame_processor_setup
 
 
 def _query(service: AssemblyAISTTService) -> dict[str, list[str]]:
     """Build the WebSocket URL and return its parsed query parameters."""
     return parse_qs(urlparse(service._build_ws_url()).query)
+
+
+def _setup_service(service: AssemblyAISTTService, monkeypatch, sample_rate: int) -> None:
+    """Set the service up with the given input sample rate, without connecting."""
+
+    async def fake_connect():
+        pass
+
+    monkeypatch.setattr(service, "_connect", fake_connect)
+
+    async def run():
+        await service.setup(frame_processor_setup(TaskManager(), audio_in_sample_rate=sample_rate))
+
+    asyncio.run(run())
+
+
+def test_sample_rate_inherits_setup_when_omitted(monkeypatch):
+    service = AssemblyAISTTService(api_key="test-key")
+
+    _setup_service(service, monkeypatch, 8000)
+
+    assert service.sample_rate == 8000
+    assert _query(service)["sample_rate"] == ["8000"]
+
+
+def test_explicit_sample_rate_overrides_setup(monkeypatch):
+    service = AssemblyAISTTService(api_key="test-key", sample_rate=16000)
+
+    _setup_service(service, monkeypatch, 8000)
+
+    assert service.sample_rate == 16000
+    assert _query(service)["sample_rate"] == ["16000"]
 
 
 def test_default_model_is_universal_3_5_pro():
@@ -105,6 +141,7 @@ def test_interruption_delay_out_of_range_raises(value):
         ("u3-rt-pro", True),
         ("u3-rt-pro-beta-1", True),
         ("universal-3-5-pro", True),
+        ("universal-3-6-pro", True),
         ("universal-streaming-english", False),
         ("universal-streaming-multilingual", False),
         (None, False),
@@ -195,6 +232,54 @@ def test_update_agent_context_works_for_universal_3_5_pro():
     service = AssemblyAISTTService(
         api_key="test-key",
         settings=AssemblyAISTTService.Settings(model="universal-3-5-pro"),
+    )
+    sent = []
+
+    async def fake_send(**fields):
+        sent.append(fields)
+
+    service._send_update_configuration = fake_send
+    asyncio.run(service.update_agent_context("hello"))
+
+    assert sent == [{"agent_context": "hello"}]
+
+
+# --- universal-3-6-pro (U3 Pro family; universal-3-5-pro upgraded) ---
+
+
+def test_u3_pro_features_sent_for_universal_3_6_pro():
+    # universal-3-6-pro is universal-3-5-pro upgraded and supports every u3-rt-pro param.
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(
+            model="universal-3-6-pro",
+            agent_context="May I take your order?",
+            previous_context_n_turns=5,
+            interruption_delay=300,
+        ),
+    )
+    q = _query(service)
+    assert q["speech_model"] == ["universal-3-6-pro"]
+    assert q["agent_context"] == ["May I take your order?"]
+    assert q["previous_context_n_turns"] == ["5"]
+    assert q["interruption_delay"] == ["300"]
+    assert q["continuous_partials"] == ["true"]
+
+
+def test_universal_3_6_pro_allows_assemblyai_turn_detection_mode():
+    # vad_force_turn_endpoint=False requires a U3 Pro family model; u3.6 qualifies.
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(model="universal-3-6-pro"),
+        vad_force_turn_endpoint=False,
+    )
+    assert is_u3_pro_model(service._settings.model)
+
+
+def test_update_agent_context_works_for_universal_3_6_pro():
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(model="universal-3-6-pro"),
     )
     sent = []
 
@@ -497,6 +582,43 @@ def test_language_codes_sent_json_encoded(languages, expected):
     assert _query(service)["language_codes"] == [json.dumps(expected)]
 
 
+@pytest.mark.parametrize(
+    "language, expected",
+    [
+        (Language.UR, "ur"),
+        (Language.RU, "ru"),
+        (Language.KO, "ko"),
+        (Language.CA, "ca"),
+        (Language.GL, "gl"),
+        (Language.RO, "ro"),
+        (Language.ET, "et"),
+        (Language.FA, "fa"),
+        (Language.YUE, "yue"),
+        (Language.AF, "af"),
+        (Language.MR, "mr"),
+        (Language.ZU, "zu"),
+        (Language.XH, "xh"),
+        (Language.NN, "nn"),
+    ],
+)
+def test_language_codes_covers_universal_3_6_pro_additions(language, expected):
+    # universal-3-6-pro inherits universal-3-5-pro's full T1+T2+T3 language set;
+    # these are verified-map entries, not the unlisted-language fallback.
+    sink = io.StringIO()
+    handler_id = logger.add(sink, level="WARNING", format="{message}")
+    try:
+        service = AssemblyAISTTService(
+            api_key="test-key",
+            settings=AssemblyAISTTService.Settings(language_codes=[language]),
+        )
+        query = _query(service)
+    finally:
+        logger.remove(handler_id)
+
+    assert query["language_codes"] == [json.dumps([expected])]
+    assert "not verified" not in sink.getvalue()
+
+
 @pytest.mark.parametrize("model", ["universal-streaming-multilingual", "u3-rt-pro-beta-1"])
 def test_language_codes_sent_for_u3_pro_models_only(model):
     # Steering is prompt-based, so only the U3 Pro family accepts it.
@@ -588,9 +710,9 @@ def test_language_codes_unlisted_language_forwarded():
     # verified map is forwarded as its base code rather than rejected here.
     service = AssemblyAISTTService(
         api_key="test-key",
-        settings=AssemblyAISTTService.Settings(language_codes=[Language.KO]),
+        settings=AssemblyAISTTService.Settings(language_codes=[Language.PL]),
     )
-    assert _query(service)["language_codes"] == [json.dumps(["ko"])]
+    assert _query(service)["language_codes"] == [json.dumps(["pl"])]
 
 
 def test_language_codes_at_limit_allowed():
@@ -648,14 +770,24 @@ def test_prompt_and_keyterms_sent_together_for_u3_rt_pro():
 
 
 def test_prompt_and_keyterms_raise_for_universal_streaming():
-    # Older models keep the client-side mutual-exclusivity check.
-    with pytest.raises(ValueError, match="only U3 Pro models"):
+    with pytest.raises(ValueError, match="only supported by U3 Pro models"):
         AssemblyAISTTService(
             api_key="test-key",
             settings=AssemblyAISTTService.Settings(
                 model="universal-streaming-english",
                 prompt="Some context for the session.",
                 keyterms_prompt=["alpha", "beta"],
+            ),
+        )
+
+
+def test_prompt_alone_raises_for_universal_streaming():
+    with pytest.raises(ValueError, match="only supported by U3 Pro models"):
+        AssemblyAISTTService(
+            api_key="test-key",
+            settings=AssemblyAISTTService.Settings(
+                model="universal-streaming-english",
+                prompt="Some context for the session.",
             ),
         )
 
@@ -957,9 +1089,9 @@ def test__process_assistant_turn_noop_when_carryover_disabled():
     assert sent == []
 
 
-def test_speech_started_starts_metrics_after_interruption():
-    # broadcast_interruption() stops all metrics, so processing metrics must
-    # start after it or they would be stopped immediately.
+def test_speech_started_proposes_turn_without_interrupting():
+    # The service proposes the turn; the user turn strategies decide it and own
+    # the interruption, so nothing is interrupted from here.
     service = AssemblyAISTTService(api_key="test-key", vad_force_turn_endpoint=False)
     events = []
 
@@ -969,20 +1101,26 @@ def test_speech_started_starts_metrics_after_interruption():
     async def fake_broadcast_interruption():
         events.append(("interruption", None))
 
-    async def fake_start_processing_metrics():
-        events.append(("start_metrics", None))
-
     service.broadcast_frame = fake_broadcast_frame
     service.broadcast_interruption = fake_broadcast_interruption
-    service.start_processing_metrics = fake_start_processing_metrics
 
     asyncio.run(service._handle_speech_started(None))
 
-    assert events == [
-        ("broadcast", UserStartedSpeakingFrame),
-        ("interruption", None),
-        ("start_metrics", None),
-    ]
+    assert events == [("broadcast", ProposedUserStartedSpeakingFrame)]
+
+
+def test_should_interrupt_rides_on_recommended_strategies():
+    # should_interrupt no longer gates a local broadcast; it configures the
+    # strategies the service recommends via its metadata frame.
+    for should_interrupt in (True, False):
+        service = AssemblyAISTTService(
+            api_key="test-key",
+            vad_force_turn_endpoint=False,
+            should_interrupt=should_interrupt,
+        )
+        strategies = service.service_metadata_frame().user_turn_strategies
+        assert isinstance(strategies, ExternalUserTurnStrategies)
+        assert strategies.enable_interruptions is should_interrupt
 
 
 if __name__ == "__main__":

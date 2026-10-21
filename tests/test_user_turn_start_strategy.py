@@ -6,14 +6,14 @@
 
 import asyncio
 import unittest
+import warnings
 from unittest.mock import Mock
 
 from pipecat.frames.frames import (
-    BotOutputAudioPauseFrame,
-    BotOutputAudioResumeFrame,
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     InterimTranscriptionFrame,
+    ProposedUserStartedSpeakingFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
     VADUserStartedSpeakingFrame,
@@ -21,13 +21,14 @@ from pipecat.frames.frames import (
 )
 from pipecat.turns.types import ProcessFrameResult
 from pipecat.turns.user_start import (
+    BaseUserTurnStartStrategy,
     ExternalUserTurnStartStrategy,
     MinWordsUserTurnStartStrategy,
-    ProvisionalVADUserTurnStartStrategy,
     TranscriptionUserTurnStartStrategy,
     VADUserTurnStartStrategy,
 )
 from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
+from tests.frame_processor_helpers import frame_processor_setup
 
 
 class TestMinWordsInterruptionStrategy(unittest.IsolatedAsyncioTestCase):
@@ -191,232 +192,89 @@ class TestTranscriptionUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(should_start)
 
 
-class TestProvisionalVADUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.task_manager = TaskManager()
-        self.task_manager.setup(TaskManagerParams(loop=asyncio.get_running_loop()))
-
-    async def test_vad_while_bot_speaking_pauses_without_starting_turn(self):
-        strategy = ProvisionalVADUserTurnStartStrategy(pause_secs=0.05)
-        await strategy.setup(self.task_manager)
-
-        pushed_frames = []
-        should_start = False
-
-        @strategy.event_handler("on_push_frame")
-        async def on_push_frame(strategy, frame, direction):
-            pushed_frames.append(frame)
-
-        @strategy.event_handler("on_user_turn_started")
-        async def on_user_turn_started(strategy, params):
-            nonlocal should_start
-            should_start = True
-
-        await strategy.process_frame(BotStartedSpeakingFrame())
-        result = await strategy.process_frame(VADUserStartedSpeakingFrame())
-
-        self.assertEqual(result, ProcessFrameResult.CONTINUE)
-        self.assertFalse(should_start)
-        self.assertIsInstance(pushed_frames[-1], BotOutputAudioPauseFrame)
-
-        await strategy.cleanup()
-
-    async def test_transcript_during_provisional_pause_starts_turn(self):
-        strategy = ProvisionalVADUserTurnStartStrategy(pause_secs=1.0)
-        await strategy.setup(self.task_manager)
-
-        pushed_frames = []
-        should_start = False
-
-        @strategy.event_handler("on_push_frame")
-        async def on_push_frame(strategy, frame, direction):
-            pushed_frames.append(frame)
-
-        @strategy.event_handler("on_user_turn_started")
-        async def on_user_turn_started(strategy, params):
-            nonlocal should_start
-            should_start = True
-
-        await strategy.process_frame(BotStartedSpeakingFrame())
-        await strategy.process_frame(VADUserStartedSpeakingFrame())
-        result = await strategy.process_frame(
-            InterimTranscriptionFrame(text="Hello", user_id="cat", timestamp="")
-        )
-
-        self.assertEqual(result, ProcessFrameResult.STOP)
-        self.assertTrue(should_start)
-        # Confirming the turn resumes output audio explicitly so the transport
-        # is unblocked even when interruptions are disabled.
-        self.assertEqual(
-            [type(frame) for frame in pushed_frames],
-            [BotOutputAudioPauseFrame, BotOutputAudioResumeFrame],
-        )
-
-        await strategy.cleanup()
-
-    async def test_no_transcript_resumes_and_locks_out_until_bot_stops(self):
-        strategy = ProvisionalVADUserTurnStartStrategy(pause_secs=0.01)
-        await strategy.setup(self.task_manager)
-
-        pushed_frames = []
-        should_start = False
-        reset_aggregation = Mock()
-
-        @strategy.event_handler("on_push_frame")
-        async def on_push_frame(strategy, frame, direction):
-            pushed_frames.append(frame)
-
-        @strategy.event_handler("on_user_turn_started")
-        async def on_user_turn_started(strategy, params):
-            nonlocal should_start
-            should_start = True
-
-        @strategy.event_handler("on_reset_aggregation")
-        async def on_reset_aggregation(strategy):
-            reset_aggregation()
-
-        await strategy.process_frame(BotStartedSpeakingFrame())
-        await strategy.process_frame(VADUserStartedSpeakingFrame())
-        await self._wait_for_frame(pushed_frames, BotOutputAudioResumeFrame)
-
-        result = await strategy.process_frame(
-            InterimTranscriptionFrame(text="late", user_id="cat", timestamp="")
-        )
-
-        self.assertEqual(result, ProcessFrameResult.CONTINUE)
-        self.assertFalse(should_start)
-        reset_aggregation.assert_called_once()
-
-        await strategy.process_frame(BotStoppedSpeakingFrame())
-        result = await strategy.process_frame(
-            TranscriptionFrame(text="new", user_id="cat", timestamp="")
-        )
-        self.assertEqual(result, ProcessFrameResult.STOP)
-        self.assertTrue(should_start)
-
-        await strategy.cleanup()
-
-    async def test_turn_started_during_provisional_pause_resumes_output_audio(self):
-        # A long pause window keeps the provisional pause armed so the only way
-        # the transport gets resumed is the handle_user_turn_started() guard.
-        strategy = ProvisionalVADUserTurnStartStrategy(pause_secs=10.0)
-        await strategy.setup(self.task_manager)
-
-        pushed_frames = []
-
-        @strategy.event_handler("on_push_frame")
-        async def on_push_frame(strategy, frame, direction):
-            pushed_frames.append(frame)
-
-        await strategy.process_frame(BotStartedSpeakingFrame())
-        await strategy.process_frame(VADUserStartedSpeakingFrame())
-        self.assertIsInstance(pushed_frames[-1], BotOutputAudioPauseFrame)
-
-        await strategy.handle_user_turn_started()
-
-        self.assertIsInstance(pushed_frames[-1], BotOutputAudioResumeFrame)
-
-        await strategy.cleanup()
-
-    async def test_turn_stopped_during_provisional_pause_resumes_output_audio(self):
-        # Turns can end by any path (e.g. a forced semantic stop) while a
-        # provisional pause is armed; the stop callback must resume audio.
-        strategy = ProvisionalVADUserTurnStartStrategy(pause_secs=10.0)
-        await strategy.setup(self.task_manager)
-
-        pushed_frames = []
-
-        @strategy.event_handler("on_push_frame")
-        async def on_push_frame(strategy, frame, direction):
-            pushed_frames.append(frame)
-
-        await strategy.process_frame(BotStartedSpeakingFrame())
-        await strategy.process_frame(VADUserStartedSpeakingFrame())
-        self.assertIsInstance(pushed_frames[-1], BotOutputAudioPauseFrame)
-
-        await strategy.handle_user_turn_stopped()
-
-        self.assertIsInstance(pushed_frames[-1], BotOutputAudioResumeFrame)
-        # Live bot-speaking state survives the stop callback.
-        self.assertTrue(strategy._bot_speaking)
-
-        await strategy.cleanup()
-
-    async def test_cleanup_during_provisional_pause_resumes_output_audio(self):
-        strategy = ProvisionalVADUserTurnStartStrategy(pause_secs=10.0)
-        await strategy.setup(self.task_manager)
-
-        pushed_frames = []
-
-        @strategy.event_handler("on_push_frame")
-        async def on_push_frame(strategy, frame, direction):
-            pushed_frames.append(frame)
-
-        await strategy.process_frame(BotStartedSpeakingFrame())
-        await strategy.process_frame(VADUserStartedSpeakingFrame())
-        self.assertIsInstance(pushed_frames[-1], BotOutputAudioPauseFrame)
-
-        await strategy.cleanup()
-
-        self.assertIsInstance(pushed_frames[-1], BotOutputAudioResumeFrame)
-
-    async def test_transcript_resumes_output_audio_when_interruptions_disabled(self):
-        # With interruptions disabled, trigger_user_turn_started() emits no
-        # InterruptionFrame, so the strategy must resume the transport itself.
-        strategy = ProvisionalVADUserTurnStartStrategy(pause_secs=10.0, enable_interruptions=False)
-        await strategy.setup(self.task_manager)
-
-        pushed_frames = []
-        should_start = False
-
-        @strategy.event_handler("on_push_frame")
-        async def on_push_frame(strategy, frame, direction):
-            pushed_frames.append(frame)
-
-        @strategy.event_handler("on_user_turn_started")
-        async def on_user_turn_started(strategy, params):
-            nonlocal should_start
-            should_start = True
-
-        await strategy.process_frame(BotStartedSpeakingFrame())
-        await strategy.process_frame(VADUserStartedSpeakingFrame())
-        result = await strategy.process_frame(
-            InterimTranscriptionFrame(text="Hello", user_id="cat", timestamp="")
-        )
-
-        self.assertEqual(result, ProcessFrameResult.STOP)
-        self.assertTrue(should_start)
-        self.assertEqual(
-            [type(frame) for frame in pushed_frames],
-            [BotOutputAudioPauseFrame, BotOutputAudioResumeFrame],
-        )
-
-        await strategy.cleanup()
-
-    async def _wait_for_frame(self, frames, frame_type):
-        for _ in range(20):
-            if any(isinstance(frame, frame_type) for frame in frames):
-                return
-            await asyncio.sleep(0.01)
-        self.fail(f"{frame_type.__name__} was not pushed")
-
-
 class TestExternalUserTurnStartStrategy(unittest.IsolatedAsyncioTestCase):
+    async def _capture_params(self, strategy):
+        captured = []
+
+        @strategy.event_handler("on_user_turn_started")
+        async def on_user_turn_started(strategy, params):
+            captured.append(params)
+
+        return captured
+
     async def test_external_strategy(self):
         strategy = ExternalUserTurnStartStrategy()
+        captured = await self._capture_params(strategy)
 
-        should_start = None
+        await strategy.process_frame(VADUserStartedSpeakingFrame())
+        self.assertFalse(captured)
+
+        await strategy.process_frame(UserStartedSpeakingFrame())
+        self.assertTrue(captured)
+
+    async def test_proposal_starts_the_turn_with_emission_enabled(self):
+        strategy = ExternalUserTurnStartStrategy()
+        captured = await self._capture_params(strategy)
+
+        await strategy.process_frame(ProposedUserStartedSpeakingFrame())
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(captured[0].enable_user_speaking_frames)
+        self.assertTrue(captured[0].enable_interruptions)
+
+    async def test_real_turn_frame_starts_the_turn_with_emission_suppressed(self):
+        strategy = ExternalUserTurnStartStrategy()
+        captured = await self._capture_params(strategy)
+
+        await strategy.process_frame(UserStartedSpeakingFrame())
+        self.assertEqual(len(captured), 1)
+        self.assertFalse(captured[0].enable_user_speaking_frames)
+        self.assertFalse(captured[0].enable_interruptions)
+
+    async def test_configured_flags_apply_to_proposals_only(self):
+        """Construction settings shape the decide path; the adopt path always suppresses."""
+        strategy = ExternalUserTurnStartStrategy(enable_interruptions=False)
+        captured = await self._capture_params(strategy)
+
+        await strategy.process_frame(ProposedUserStartedSpeakingFrame())
+        self.assertFalse(captured[0].enable_interruptions)
+        self.assertTrue(captured[0].enable_user_speaking_frames)
+
+        await strategy.process_frame(UserStartedSpeakingFrame())
+        self.assertFalse(captured[1].enable_interruptions)
+        self.assertFalse(captured[1].enable_user_speaking_frames)
+
+
+class TestBaseUserTurnStartStrategyDeprecations(unittest.IsolatedAsyncioTestCase):
+    async def _capture_params(self, strategy):
+        captured = []
 
         @strategy.event_handler("on_user_turn_started")
         async def on_user_turn_started(strategy, params):
-            nonlocal should_start
-            should_start = True
+            captured.append(params)
 
-        await strategy.process_frame(VADUserStartedSpeakingFrame())
-        self.assertFalse(should_start)
+        return captured
 
-        await strategy.process_frame(UserStartedSpeakingFrame())
-        self.assertTrue(should_start)
+    async def test_enable_user_speaking_frames_warns(self):
+        with self.assertWarns(DeprecationWarning) as caught:
+            BaseUserTurnStartStrategy(enable_user_speaking_frames=False)
+        self.assertIn("enable_user_speaking_frames", str(caught.warning))
+
+    async def test_enable_user_speaking_frames_applies(self):
+        with self.assertWarns(DeprecationWarning):
+            strategy = BaseUserTurnStartStrategy(enable_user_speaking_frames=False)
+        captured = await self._capture_params(strategy)
+
+        await strategy.trigger_user_turn_started()
+        self.assertFalse(captured[0].enable_user_speaking_frames)
+
+    async def test_omitting_enable_user_speaking_frames_is_silent(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            strategy = BaseUserTurnStartStrategy()
+        captured = await self._capture_params(strategy)
+
+        await strategy.trigger_user_turn_started()
+        self.assertTrue(captured[0].enable_user_speaking_frames)
 
 
 if __name__ == "__main__":

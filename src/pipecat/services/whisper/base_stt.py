@@ -13,18 +13,19 @@ interface, including language mapping, metrics generation, and error handling.
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
-import httpx
 from loguru import logger
 from openai import AsyncOpenAI
 from openai.types.audio import Transcription
 
 from pipecat.frames.frames import ErrorFrame, Frame, TranscriptionFrame
-from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_latency import WHISPER_TTFS_P99
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.transcriptions.language import Language, resolve_language
+from pipecat.utils.http import AsyncHTTPClient
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven
 
 
 @dataclass
@@ -37,8 +38,8 @@ class BaseWhisperSTTSettings(STTSettings):
         temperature: Sampling temperature between 0 and 1.
     """
 
-    prompt: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    temperature: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    prompt: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    temperature: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 def language_to_whisper_language(language: Language) -> str:
@@ -135,7 +136,7 @@ class BaseWhisperSTTService(SegmentedSTTService):
         model: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
-        http_client: httpx.AsyncClient | None = None,
+        http_client: AsyncHTTPClient | None = None,
         language: Language | None = None,
         prompt: str | None = None,
         temperature: float | None = None,
@@ -156,11 +157,13 @@ class BaseWhisperSTTService(SegmentedSTTService):
 
             api_key: Service API key. Defaults to None.
             base_url: Service API base URL. Defaults to None.
-            http_client: Custom ``httpx.AsyncClient`` for API requests, e.g. one with a
+            http_client: Custom async HTTP client for API requests, e.g. one with a
                 longer request timeout. Prefer ``openai.DefaultAsyncHttpxClient``, which
-                keeps the SDK's connection limits and redirect handling; a bare
-                ``httpx.AsyncClient`` uses httpx's defaults instead. Defaults to None,
-                which lets the SDK build its own client.
+                keeps the SDK's connection limits and redirect handling; a bare client
+                uses its own defaults instead. The SDK's HTTP client family follows the
+                installed ``openai`` version, so build any ``Timeout`` you pass it from
+                that same family. Defaults to None, which lets the SDK build its own
+                client.
             language: Language of the audio input.
 
                 .. deprecated:: 0.0.105
@@ -274,7 +277,9 @@ class BaseWhisperSTTService(SegmentedSTTService):
 
             await self.stop_processing_metrics()
 
-            text = response.text.strip()
+            # OpenAI-compatible servers (e.g. mlx_audio.server) may return
+            # `"text": null` for silent or very short audio; treat it as empty.
+            text = (response.text or "").strip()
 
             if not text:
                 logger.warning("Received empty transcription from API")

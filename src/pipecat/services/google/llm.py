@@ -10,12 +10,15 @@ This module provides Google Gemini integration for the Pipecat framework,
 including LLM services, context management, and message aggregation.
 """
 
+import asyncio
 import io
 import os
+import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union, cast
 
 from loguru import logger
 from PIL import Image
@@ -25,12 +28,8 @@ from pipecat.adapters.base_llm_adapter import LLMContextConversionError
 from pipecat.adapters.services.gemini_adapter import GeminiLLMAdapter
 from pipecat.frames.frames import (
     AssistantImageRawFrame,
-    AudioRawFrame,
     BotStoppedSpeakingFrame,
     Frame,
-    FunctionCallCancelFrame,
-    FunctionCallInProgressFrame,
-    FunctionCallResultFrame,
     FunctionCallsFromLLMInfoFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
@@ -46,15 +45,11 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.google.frames import LLMSearchResponseFrame
 from pipecat.services.google.utils import update_google_client_http_options
 from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
-from pipecat.services.settings import (
-    NOT_GIVEN,
-    LLMSettings,
-    _NotGiven,
-    assert_given,
-    is_given,
-)
+from pipecat.services.settings import LLMSettings
 from pipecat.utils.deprecation import deprecated
+from pipecat.utils.text.alnum_utils import has_alnum
 from pipecat.utils.tracing.service_decorators import traced_llm
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 # Suppress gRPC fork warnings
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
@@ -63,6 +58,7 @@ try:
     import google.genai as genai
     from google.api_core.exceptions import DeadlineExceeded
     from google.genai.types import (
+        FinishReason,
         GenerateContentConfig,
         GenerateContentResponse,
         HttpOptions,
@@ -70,25 +66,41 @@ try:
     )
 
     # Temporary hack to be able to process Nano Banana returned images.
-    genai._api_client.READ_BUFFER_SIZE = 5 * 1024 * 1024
+    genai._api_client.READ_BUFFER_SIZE = 5 * 1024 * 1024  # pyright: ignore[reportAttributeAccessIssue]
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error('In order to use Google AI, you need to `uv add "pipecat-ai[google]"`.')
     raise ImportError(f"Missing module: {e}") from e
 
 
+# The lowest thinking level each model accepts, keyed by model name prefix. A
+# model that isn't listed is assumed to accept "minimal", the fastest setting.
+_LOWEST_MODEL_THINKING_LEVELS = {
+    "gemini-3.7-flash": "low",
+    "gemini-3.8-flash": "low",
+}
+
+# Models that take their thinking configuration from thinking_level, keyed by
+# model name prefix. Whether one of these honors a thinking_budget set alongside
+# it varies by model and by backend, so such a budget can't be relied on.
+_MODELS_SUPPORTING_THINKING_LEVEL = ("gemini-3",)
+
+
 class GoogleThinkingConfig(BaseModel):
     """Configuration for controlling the model's internal "thinking" process used before generating a response.
 
-    Gemini 2.5 and 3 series models have this thinking process.
+    Gemini 2.5 and 3 series models have this thinking process. Set either
+    ``thinking_level`` or ``thinking_budget``, never both.
 
     Parameters:
-        thinking_level: Thinking level for Gemini 3 models.
-            For Gemini 3 Pro, this can be "low" or "high".
-            For Gemini 3 Flash, this can be "minimal", "low", "medium", or "high".
-            If not provided, Gemini 3 models default to "high".
+        thinking_level: Thinking level, for Gemini 3 models.
+            Gemini 3 Flash accepts "minimal", "low", "medium", and "high",
+            except Gemini 3.7 Flash and Gemini 3.8 Flash, which accept only
+            "low", "medium", and "high". Gemini 3 Pro accepts "low" and "high".
+            If not provided, the flash models default to "medium" and Pro
+            defaults to "high".
             Note: Gemini 2.5 series must use thinking_budget instead.
-        thinking_budget: Token budget for thinking, for Gemini 2.5 series.
+        thinking_budget: Token budget for thinking, for the Gemini 2.5 series.
             -1 for dynamic thinking (model decides), 0 to disable thinking,
             or a specific token count (e.g., 128-32768 for 2.5 Pro).
             If not provided, most models today default to dynamic thinking.
@@ -120,10 +132,10 @@ class GoogleLLMSettings(LLMSettings):
             left unspecified keep the Gemini API defaults.
     """
 
-    thinking: Union["GoogleLLMService.ThinkingConfig", None, _NotGiven] = field(
+    thinking: Union["GoogleLLMService.ThinkingConfig", None, NotGiven] = field(
         default_factory=lambda: NOT_GIVEN
     )
-    safety_settings: list[SafetySetting] | None | _NotGiven = field(
+    safety_settings: list[SafetySetting] | None | NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
 
@@ -159,6 +171,8 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
 
     # Overriding the default adapter to use the Gemini one.
     adapter_class = GeminiLLMAdapter
+
+    supports_response_schema: bool = True
 
     # Backward compatibility: ThinkingConfig used to be defined inline here.
     ThinkingConfig = GoogleThinkingConfig
@@ -206,6 +220,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         tools: list[dict[str, Any]] | None = None,
         tool_config: dict[str, Any] | None = None,
         http_options: HttpOptions | None = None,
+        stream_idle_timeout_secs: float | None = 20.0,
+        retry_timeout_secs: float | None = 5.0,
+        retry_on_timeout: bool | None = False,
         **kwargs,
     ):
         """Initialize the Google LLM service.
@@ -236,11 +253,28 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             tools: List of available tools/functions.
             tool_config: Configuration for tool usage.
             http_options: HTTP options for the client.
+            stream_idle_timeout_secs: How long to wait for the next chunk of a streamed
+                response before giving up on it. Bounds the wait when the API accepts a
+                request and then stops producing without closing the stream. This is a
+                gap between chunks, not a limit on how long a response may take overall.
+                The first chunk is the slowest, since its wait spans the whole round trip
+                including any thinking the model does before it emits anything; raise this
+                for models configured to think at length. Set to ``None`` to wait
+                indefinitely.
+            retry_timeout_secs: How long to wait for the first chunk before giving up
+                on the request and re-issuing it, when ``retry_on_timeout`` is set.
+                Like the first-chunk wait above, this window spans the whole round
+                trip including any thinking, so it is only a good fit for models that
+                start emitting quickly.
+            retry_on_timeout: Whether to re-issue the request once if the first chunk
+                doesn't arrive within ``retry_timeout_secs``. Only the first chunk is
+                retried: once a chunk has been pushed downstream, re-issuing would
+                duplicate the response.
             **kwargs: Additional arguments passed to parent class.
         """
         # 1. Initialize default_settings with hardcoded defaults
         default_settings = self.Settings(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             system_instruction=None,
             max_tokens=4096,
             temperature=None,
@@ -286,12 +320,14 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         self._http_options = update_google_client_http_options(http_options)
         self._tools = tools
         self._tool_config = tool_config
-
-        # Store pending function calls that need to be executed after TTS
-        self._pending_function_calls = []
+        self._stream_idle_timeout_secs = stream_idle_timeout_secs
+        self._retry_timeout_secs = retry_timeout_secs
+        self._retry_on_timeout = retry_on_timeout
 
         # Initialize the API client. Subclasses can override this if needed.
         self.create_client()
+
+        self._warn_if_thinking_budget_ignored()
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate usage metrics.
@@ -305,11 +341,27 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         """Create the Gemini client instance. Subclasses can override this."""
         self._client = genai.Client(api_key=self._api_key, http_options=self._http_options)
 
+    @staticmethod
+    def model_supports_response_schema(model: str) -> bool:
+        """Whether a model can enforce a response schema.
+
+        Gemini takes a JSON schema from the 2.5 models on. A model id without
+        a version is assumed to support it.
+
+        Args:
+            model: The model name.
+        """
+        match = re.search(r"gemini(?:-[a-z]+)*-(\d+)(?:\.(\d+))?", model)
+        if not match:
+            return True
+        return (int(match.group(1)), int(match.group(2) or 0)) >= (2, 5)
+
     async def run_inference(
         self,
         context: LLMContext,
         max_tokens: int | None = None,
         system_instruction: str | None = None,
+        response_schema: dict[str, Any] | None = None,
     ) -> str | None:
         """Run a one-shot, out-of-band (i.e. out-of-pipeline) inference with the given LLM context.
 
@@ -319,6 +371,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                 overrides the service's default max_tokens setting.
             system_instruction: Optional system instruction to use for this inference.
                 If provided, overrides any system instruction in the context.
+            response_schema: Optional JSON schema the reply must follow. The
+                service asks the provider to enforce it, so the reply is JSON
+                text matching the schema.
 
         Returns:
             The LLM's response as a string, or None if no response is generated.
@@ -326,10 +381,14 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         messages = []
         system = []
         tools = []
-        effective_instruction = system_instruction or self._settings.system_instruction
+        effective_instruction = system_instruction or assert_given(
+            self._settings.system_instruction
+        )
         adapter = self.get_llm_adapter()
         params = adapter.get_llm_invocation_params(
-            context, system_instruction=effective_instruction
+            context,
+            system_instruction=effective_instruction,
+            ensure_last_message_is_user=self._should_inject_trailing_user_message(),
         )
         messages = params["messages"]
         system = params["system_instruction"]
@@ -344,18 +403,28 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         if max_tokens is not None:
             generation_params["max_output_tokens"] = max_tokens
 
+        response_schema = self._check_response_schema(response_schema)
+        if response_schema is not None:
+            generation_params["response_mime_type"] = "application/json"
+            generation_params["response_json_schema"] = response_schema
+
         generation_config = GenerateContentConfig(**generation_params)
 
         # Use the new google-genai client's async method
+        assert self._client is not None
+
+        model = assert_given(self._settings.model)
+        assert model is not None
+
         response = await self._client.aio.models.generate_content(
-            model=self._settings.model,
-            contents=messages,
+            model=model,
+            contents=cast(Any, messages),
             config=generation_config,
         )
 
         # Extract text from response
         if response.candidates and response.candidates[0].content:
-            for part in response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts or []:
                 if part.text:
                     return part.text
 
@@ -375,7 +444,8 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             tool_config: Optional tool configuration.
 
         Returns:
-            Dictionary of generation parameters with None values filtered out.
+            Dictionary of generation parameters with None values filtered out,
+            carrying the low-latency thinking default when none is configured.
         """
         # Filter out None values and create GenerationContentConfig
         generation_params = {
@@ -386,6 +456,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                 "top_p": self._settings.top_p,
                 "top_k": self._settings.top_k,
                 "max_output_tokens": self._settings.max_tokens,
+                "seed": self._settings.seed,
                 "safety_settings": assert_given(self._settings.safety_settings),
                 "tools": tools,
                 "tool_config": tool_config,
@@ -401,7 +472,48 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         if self._settings.extra:
             generation_params.update(self._settings.extra)
 
+        # Applied last, so an explicit thinking config from the settings or from
+        # extra wins over the low-latency default.
+        self._maybe_unset_thinking_budget(generation_params)
+
         return generation_params
+
+    async def _update_settings(self, delta: GoogleLLMSettings) -> dict[str, Any]:
+        """Apply a settings delta, re-checking the thinking configuration.
+
+        Args:
+            delta: An LLM settings delta.
+
+        Returns:
+            Dict mapping changed field names to their previous values.
+        """
+        changed = await super()._update_settings(delta)
+
+        if "model" in changed or "thinking" in changed:
+            self._warn_if_thinking_budget_ignored()
+
+        return changed
+
+    def _warn_if_thinking_budget_ignored(self):
+        """Warn when a thinking budget is set on a model that takes a level instead.
+
+        Gemini 3 models control thinking through ``thinking_level``. Whether a
+        budget set alongside one is honored, quietly ignored, or rejected varies
+        by model and by backend, and the rejection names no field, so this
+        warning is the only signal the caller gets in the cases that don't work.
+        """
+        thinking = assert_given(self._settings.thinking)
+        if not thinking or thinking.thinking_budget is None:
+            return
+
+        model = assert_given(self._settings.model)
+        if not model or not model.startswith(_MODELS_SUPPORTING_THINKING_LEVEL):
+            return
+
+        logger.warning(
+            f"{self}: thinking_budget is the pre-Gemini 3 thinking control, and {model} may "
+            "ignore it or reject the request outright. Use thinking_level instead."
+        )
 
     def _maybe_unset_thinking_budget(self, generation_params: dict[str, Any]):
         try:
@@ -414,18 +526,52 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                 return
             # Apply model-aware low-latency thinking defaults.
             # Gemini 2.5 Flash: disable thinking via thinking_budget.
-            # Gemini 3+ Flash: use minimal thinking via thinking_level.
+            # Gemini 3+ Flash: use the lowest thinking_level the model accepts.
             if model.startswith("gemini-2.5-flash"):
                 generation_params["thinking_config"] = {"thinking_budget": 0}
             elif model.startswith("gemini-3") and "flash" in model:
-                generation_params["thinking_config"] = {"thinking_level": "minimal"}
+                level = next(
+                    (
+                        lowest
+                        for prefix, lowest in _LOWEST_MODEL_THINKING_LEVELS.items()
+                        if model.startswith(prefix)
+                    ),
+                    "minimal",
+                )
+                generation_params["thinking_config"] = {"thinking_level": level}
         except Exception as e:
             logger.error(f"Failed to unset thinking budget: {e}")
+
+    # Models known to accept a request whose contents end with a model turn,
+    # continuing that turn as the start of the response. Newer models reject
+    # such requests, so this is a frozen legacy set: any model NOT matching is
+    # assumed to reject them and gets a trailing user message injected when
+    # needed. gemini-3.5-flash accepts them but shares a prefix with
+    # gemini-3.5-flash-lite, which doesn't, so it's left out.
+    _PREFILL_SUPPORTED_PATTERNS = (
+        "gemini-2.",
+        "gemini-3-",
+        "gemini-3.1-",
+        "gemini-pro-latest",
+    )
+
+    def _should_inject_trailing_user_message(self) -> bool:
+        """Whether to fix up requests whose contents end with a model turn.
+
+        Models without support for continuing a trailing model turn reject such
+        requests, so injection is on for every model not known to support it.
+        Subclasses with other model naming can override
+        ``_PREFILL_SUPPORTED_PATTERNS``.
+        """
+        model = self._settings.model or ""
+        return not any(model.startswith(p) for p in self._PREFILL_SUPPORTED_PATTERNS)
 
     async def _stream_content(self, context: LLMContext) -> AsyncIterator[GenerateContentResponse]:
         adapter = self.get_llm_adapter()
         params = adapter.get_llm_invocation_params(
-            context, system_instruction=assert_given(self._settings.system_instruction)
+            context,
+            system_instruction=assert_given(self._settings.system_instruction),
+            ensure_last_message_is_user=self._should_inject_trailing_user_message(),
         )
 
         logger.debug(
@@ -453,20 +599,127 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
             tool_config=tool_config,
         )
 
-        # possibly modify generation_params (in place) to set thinking to off by default
-        self._maybe_unset_thinking_budget(generation_params)
-
         generation_config = GenerateContentConfig(**generation_params)
 
-        await self.start_ttfb_metrics()
+        assert self._client is not None
+
+        model = assert_given(self._settings.model)
+        assert model is not None
+
         return await self._client.aio.models.generate_content_stream(
-            model=self._settings.model,
-            contents=messages,
+            model=model,
+            contents=cast(Any, messages),
             config=generation_config,
         )
 
+    async def _stream_response(self, context: LLMContext) -> AsyncIterator[GenerateContentResponse]:
+        """Yield the model's streamed chunks, re-issuing the request once if it stalls.
+
+        The API client sends the request lazily, when the first chunk is pulled, so a
+        request that is accepted and then produces nothing shows up as a first chunk
+        that never arrives. Re-issuing is safe only up to that point: once a chunk has
+        been yielded, its content is already on its way downstream.
+
+        Args:
+            context: The context to generate a response for.
+
+        Yields:
+            Each chunk of the streamed response.
+
+        Raises:
+            TimeoutError: If the stream stalls past the timeout it is bounded by.
+        """
+        if self._retry_on_timeout:
+            async with aclosing(
+                self._iter_stream(
+                    await self._stream_content(context),
+                    first_chunk_timeout=self._retry_timeout_secs,
+                )
+            ) as stream:
+                try:
+                    first_chunk = await stream.__anext__()
+                except StopAsyncIteration:
+                    return
+                except (TimeoutError, DeadlineExceeded):
+                    logger.debug(f"{self}: retrying content generation due to timeout")
+                else:
+                    yield first_chunk
+                    async for chunk in stream:
+                        yield chunk
+                    return
+
+        # Either retries are disabled, or the initial attempt timed out.
+        async with aclosing(
+            self._iter_stream(
+                await self._stream_content(context),
+                first_chunk_timeout=self._stream_idle_timeout_secs,
+            )
+        ) as stream:
+            async for chunk in stream:
+                yield chunk
+
+    async def _iter_stream(
+        self,
+        response: AsyncIterator[GenerateContentResponse],
+        *,
+        first_chunk_timeout: float | None,
+    ) -> AsyncGenerator[GenerateContentResponse, None]:
+        """Yield streamed chunks, giving up if the stream stalls between them.
+
+        A stream that stops producing without closing would otherwise leave the
+        response open indefinitely, since the API client applies no timeout of its
+        own. The timeout covers the gap between chunks rather than the response as
+        a whole, so a slow but healthy stream is never cut short.
+
+        Args:
+            response: The streamed response to consume.
+            first_chunk_timeout: How long to wait for the first chunk. Every later
+                chunk is bounded by ``stream_idle_timeout_secs``.
+
+        Yields:
+            Each chunk of the streamed response.
+
+        Raises:
+            TimeoutError: If the next chunk doesn't arrive in time.
+        """
+        chunks = response.__aiter__()
+        timeout = first_chunk_timeout
+        try:
+            while True:
+                try:
+                    if timeout is None:
+                        chunk = await chunks.__anext__()
+                    else:
+                        chunk = await asyncio.wait_for(chunks.__anext__(), timeout=timeout)
+                except StopAsyncIteration:
+                    return
+                yield chunk
+                timeout = self._stream_idle_timeout_secs
+        finally:
+            # Release the HTTP resources held by a stream we walk away from, whether
+            # that's because it stalled, was interrupted, or is being re-issued.
+            # Closing is best-effort: the client's stream type only promises
+            # AsyncIterator, which has no aclose().
+            aclose = getattr(response, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    def _handle_finish_reason(self, finish_reason: FinishReason):
+        """Log why Gemini stopped generating, when it stopped for a notable reason.
+
+        Anything other than a normal stop leaves the turn short of what the model
+        would otherwise have said: the response was withheld (safety, recitation,
+        prohibited content), a tool call was rejected, or the output hit the token
+        limit. Whatever text did arrive is still passed downstream.
+        """
+        if finish_reason in (FinishReason.STOP, FinishReason.FINISH_REASON_UNSPECIFIED):
+            return
+
+        logger.warning(f"{self}: response incomplete, the model stopped for {finish_reason.name}")
+
     @traced_llm
     async def _process_context(self, context: LLMContext):
+        response_generation = self._begin_tool_response()
         await self.push_frame(LLMFullResponseStartFrame())
 
         prompt_tokens = 0
@@ -478,19 +731,11 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
         grounding_metadata = None
         accumulated_text = ""
 
-        text_generated_signal = False
-
-        # Reset pending function calls when processing a new context
-        self._pending_function_calls = []
-
         try:
-            # Generate content from LLMContext
-            response = await self._stream_content(context)
+            await self.start_ttfb_metrics()
 
             function_calls = []
-            async for chunk in response:
-                # Stop TTFB metrics after the first chunk
-                await self.stop_ttfb_metrics()
+            async for chunk in self._stream_response(context):
                 # Gemini may send usage_metadata in multiple chunks with varying behavior:
                 # - Sometimes a single chunk, sometimes multiple chunks
                 # - Token counts may be cumulative (growing) or may change between chunks
@@ -507,23 +752,11 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                 if not chunk.candidates:
                     continue
 
-                for candidate in chunk.candidates:
-                    if candidate.finish_reason:
-                        finish_reason = (
-                            candidate.finish_reason.value
-                            if hasattr(candidate.finish_reason, "value")
-                            else candidate.finish_reason
-                        )
-                        finish_message = (
-                            f" finish_message={candidate.finish_message!r}"
-                            if candidate.finish_message
-                            else ""
-                        )
-                        logger.debug(
-                            f"{self}: Google generation stopped with "
-                            f"finish_reason={finish_reason}{finish_message}"
-                        )
+                # A leading chunk can carry usage metadata and no candidates, so
+                # TTFB ends at the first chunk that holds model output.
+                await self.stop_ttfb_metrics()
 
+                for candidate in chunk.candidates:
                     if candidate.content and candidate.content.parts:
                         for part in candidate.content.parts:
                             function_call_id = None
@@ -536,10 +769,13 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                                     await self.push_frame(LLMThoughtTextFrame(part.text))
                                     await self.push_frame(LLMThoughtEndFrame())
                                 else:
-                                    text_generated_signal = True
                                     accumulated_text += part.text
                                     await self._push_llm_text(part.text)
                             elif part.function_call:
+                                # A turn that only calls tools produces no answer
+                                # text, so the call itself is what the caller gets
+                                # and TTFAT ends here rather than going unmeasured.
+                                await self.stop_ttfat_metrics()
                                 function_call = part.function_call
                                 function_call_id = function_call.id or str(uuid.uuid4())
                                 logger.debug(
@@ -549,7 +785,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                                     FunctionCallFromLLM(
                                         context=context,
                                         tool_call_id=function_call_id,
-                                        function_name=function_call.name,
+                                        function_name=function_call.name or "",
                                         arguments=function_call.args or {},
                                     )
                                 )
@@ -607,7 +843,8 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                                                         "type": "thought_signature",
                                                         "signature": part.thought_signature,
                                                         "bookmark": bookmark,
-                                                    }
+                                                    },
+                                                    is_metadata=True,
                                                 )
                                             ]
                                         )
@@ -652,6 +889,9 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                             "origins": origins,
                         }
 
+                    if candidate.finish_reason:
+                        self._handle_finish_reason(candidate.finish_reason)
+
             # Handle function calls if any were collected
             if function_calls:
                 # Send the info frame with function calls so that it can be traced by service_decorators
@@ -660,18 +900,24 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
                     direction=FrameDirection.DOWNSTREAM,
                 )
 
-                # If text was generated, defer function calls until after TTS plays
-                # Otherwise, execute them immediately
-                if text_generated_signal:
-                    self._pending_function_calls = function_calls
-                    logger.debug(
-                        f"{self}: Deferring {len(function_calls)} function calls until after TTS"
+                # Defer function calls until after TTS only for speakable text.
+                # Unspeakable content (whitespace, punctuation, markup) never
+                # produces the BotStoppedSpeakingFrame that releases the
+                # deferral, so it must not count as generated text.
+                text_generated = has_alnum(accumulated_text)
+                if accumulated_text and not text_generated:
+                    logger.info(
+                        f"{self}: no speakable content ({accumulated_text[:120]!r}); "
+                        "running function calls without waiting for TTS"
                     )
-                else:
-                    logger.debug(f"{self}: Executing {len(function_calls)} function calls")
-                    await self.run_function_calls(function_calls)
-        except DeadlineExceeded:
+                await self._run_or_defer_function_calls(
+                    function_calls,
+                    text_generated=text_generated,
+                    response_generation=response_generation,
+                )
+        except (TimeoutError, DeadlineExceeded) as e:
             await self._call_event_handler("on_completion_timeout")
+            await self.push_error(error_msg="LLM completion timeout", exception=e)
         except LLMContextConversionError as e:
             await self.push_error(error_msg=str(e), exception=e)
         except Exception as e:
@@ -707,12 +953,7 @@ class GoogleLLMService(LLMService[GeminiLLMAdapter]):
 
         # Handle BotStoppedSpeakingFrame to execute pending function calls
         if isinstance(frame, BotStoppedSpeakingFrame):
-            if self._pending_function_calls:
-                logger.debug(
-                    f"{self}: Executing {len(self._pending_function_calls)} deferred function calls after TTS"
-                )
-                await self.run_function_calls(self._pending_function_calls)
-                self._pending_function_calls = []
+            await self._run_pending_node_transition_function_calls(frame)
             await self.push_frame(frame, direction)
         elif isinstance(frame, LLMContextFrame):
             await self._process_context(frame.context)

@@ -7,6 +7,7 @@
 import asyncio
 import struct
 import unittest
+import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,13 +24,17 @@ from pipecat.frames.frames import (
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
+from pipecat.pipeline.worker import PipelineParams
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
-from pipecat.tests.utils import run_test
-from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
+from pipecat.tests.utils import SleepFrame, run_test
+from pipecat.utils.asyncio.task_manager import TaskManager
 
 
 class _PassthroughResampler:
+    async def reset(self):
+        pass
+
     async def resample(
         self, audio: bytes, in_rate: int, out_rate: int
     ) -> bytes:  # pragma: no cover - trivial
@@ -37,7 +42,11 @@ class _PassthroughResampler:
 
 
 async def _make_processor(
-    *, buffer_size: int = 0, start: bool = True, auto_start: bool = False
+    *,
+    buffer_size: int = 0,
+    start: bool = True,
+    auto_start: bool = False,
+    use_unmixed_audio_for_bot_track: bool = False,
 ) -> AudioBufferProcessor:
     """Create a processor ready to record.
 
@@ -53,13 +62,13 @@ async def _make_processor(
         num_channels=2,
         buffer_size=buffer_size,
         auto_start_recording=auto_start,
+        use_unmixed_audio_for_bot_track=use_unmixed_audio_for_bot_track,
     )
     processor._input_resampler = _PassthroughResampler()
     processor._output_resampler = _PassthroughResampler()
+    processor._unmixed_output_resampler = _PassthroughResampler()
 
-    loop = asyncio.get_event_loop()
     task_manager = TaskManager()
-    task_manager.setup(TaskManagerParams(loop=loop))
     await processor.setup(
         FrameProcessorSetup(
             clock=SystemClock(),
@@ -1003,6 +1012,326 @@ class TestRecordingLifecycleEvents(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
         self.assertEqual(len(stopped), 0)
         await p.cleanup()
+
+
+TURN_SAMPLE_RATE = 16000
+
+# 0.1s of mono audio. Every run of speech below is one chunk, so a turn's audio
+# is one chunk per run its speaker contributed.
+TURN_CHUNK = b"\x11\x00" * 1600
+
+
+def _user_run():
+    """One run of user speech, paced as a real mic would deliver it."""
+    return [
+        UserStartedSpeakingFrame(),
+        SleepFrame(sleep=0.05),
+        InputAudioRawFrame(audio=TURN_CHUNK, sample_rate=TURN_SAMPLE_RATE, num_channels=1),
+        SleepFrame(sleep=0.05),
+        UserStoppedSpeakingFrame(),
+        SleepFrame(sleep=0.2),
+    ]
+
+
+def _bot_run():
+    """One run of bot speech.
+
+    Bot audio is a DataFrame and queues, while the speaking frames are
+    SystemFrames that skip the queue, so it needs time to drain before
+    BotStoppedSpeakingFrame closes the run.
+    """
+    return [
+        BotStartedSpeakingFrame(),
+        SleepFrame(sleep=0.05),
+        OutputAudioRawFrame(audio=TURN_CHUNK, sample_rate=TURN_SAMPLE_RATE, num_channels=1),
+        SleepFrame(sleep=0.1),
+        BotStoppedSpeakingFrame(),
+        SleepFrame(sleep=0.2),
+    ]
+
+
+@unittest.skip(
+    "Upstream's per-turn audio flushes on TurnTrackingObserver's on_turn_ended, which "
+    "upstream fires for the still-open turn when the pipeline ends. This fork "
+    "deliberately does not end the turn there (see _handle_pipeline_end): observers are "
+    "notified of EndFrame first, and ending the turn clears the current context, leaving "
+    "floating spans in Langfuse. Dograh does not set enable_turn_audio, so the feature is "
+    "off in production. Revisit if the fork ever enables turn audio."
+)
+class TestTurnAudio(unittest.IsolatedAsyncioTestCase):
+    """The turn audio events report each speaker once per turn."""
+
+    async def _turn_events(self, frames):
+        """Run frames through a recording processor, returning its turn audio events."""
+        processor = AudioBufferProcessor(
+            sample_rate=TURN_SAMPLE_RATE,
+            num_channels=1,
+            enable_turn_audio=True,
+            auto_start_recording=True,
+        )
+        events = []
+
+        @processor.event_handler("on_user_turn_audio")
+        async def on_user(buffer, turn):
+            events.append(("user", turn.turn_number, bytes(turn.audio)))
+
+        @processor.event_handler("on_bot_turn_audio")
+        async def on_bot(buffer, turn):
+            events.append(("bot", turn.turn_number, bytes(turn.audio)))
+
+        await run_test(
+            processor,
+            frames_to_send=frames,
+            pipeline_params=PipelineParams(
+                audio_in_sample_rate=TURN_SAMPLE_RATE, audio_out_sample_rate=TURN_SAMPLE_RATE
+            ),
+        )
+        return events
+
+    async def test_reports_each_speaker_once_for_a_turn(self):
+        events = await self._turn_events([*_user_run(), *_bot_run()])
+
+        # Turn 1 opens with the pipeline, so the first exchange lands there.
+        self.assertEqual(events, [("user", 1, TURN_CHUNK), ("bot", 1, TURN_CHUNK)])
+
+    async def test_joins_several_runs_of_speech_in_a_turn(self):
+        # The user pauses mid-thought and the bot resumes after a function call,
+        # so each speaks twice within one turn.
+        events = await self._turn_events([*_user_run(), *_user_run(), *_bot_run(), *_bot_run()])
+
+        self.assertEqual(events, [("user", 1, TURN_CHUNK * 2), ("bot", 1, TURN_CHUNK * 2)])
+
+    async def test_numbers_successive_turns(self):
+        events = await self._turn_events([*_user_run(), *_bot_run(), *_user_run(), *_bot_run()])
+
+        self.assertEqual(
+            events,
+            [
+                ("user", 1, TURN_CHUNK),
+                ("bot", 1, TURN_CHUNK),
+                ("user", 2, TURN_CHUNK),
+                ("bot", 2, TURN_CHUNK),
+            ],
+        )
+
+    async def test_reports_barged_in_audio_under_the_interrupted_turn(self):
+        # The user barges in while the bot is speaking, which ends turn 1 and
+        # starts turn 2 before the bot's cut-off audio is closed out.
+        events = await self._turn_events(
+            [
+                *_user_run(),
+                BotStartedSpeakingFrame(),
+                SleepFrame(sleep=0.05),
+                OutputAudioRawFrame(audio=TURN_CHUNK, sample_rate=TURN_SAMPLE_RATE, num_channels=1),
+                SleepFrame(sleep=0.1),
+                UserStartedSpeakingFrame(),
+                SleepFrame(sleep=0.05),
+                BotStoppedSpeakingFrame(),
+                SleepFrame(sleep=0.05),
+                InputAudioRawFrame(audio=TURN_CHUNK, sample_rate=TURN_SAMPLE_RATE, num_channels=1),
+                SleepFrame(sleep=0.05),
+                UserStoppedSpeakingFrame(),
+                SleepFrame(sleep=0.2),
+                *_bot_run(),
+            ]
+        )
+
+        self.assertEqual(
+            events,
+            [
+                ("user", 1, TURN_CHUNK),
+                ("bot", 1, TURN_CHUNK),
+                ("user", 2, TURN_CHUNK),
+                ("bot", 2, TURN_CHUNK),
+            ],
+        )
+
+    async def test_silent_speaker_is_not_reported(self):
+        # The bot greets and the user never replies, so turn 1 has no user audio.
+        events = await self._turn_events(_bot_run())
+
+        self.assertEqual(events, [("bot", 1, TURN_CHUNK)])
+
+    async def test_turn_audio_needs_turn_tracking(self):
+        # Turn boundaries come from the tracker, so without one there is nothing
+        # to report. Say so rather than going quiet.
+        processor = AudioBufferProcessor(
+            sample_rate=TURN_SAMPLE_RATE, num_channels=1, enable_turn_audio=True
+        )
+        await processor.setup(
+            FrameProcessorSetup(
+                clock=SystemClock(),
+                task_manager=TaskManager(),
+                pipeline_worker=SimpleNamespace(  # type: ignore[arg-type]
+                    app_resources=None, turn_tracking_observer=None
+                ),
+            )
+        )
+
+        with patch("pipecat.processors.audio.audio_buffer_processor.logger") as mock_logger:
+            await processor.process_frame(
+                StartFrame(audio_out_sample_rate=TURN_SAMPLE_RATE), FrameDirection.DOWNSTREAM
+            )
+
+        mock_logger.warning.assert_called_once()
+        self.assertIn("enable_turn_tracking", mock_logger.warning.call_args[0][0])
+        await processor.cleanup()
+
+    async def test_deprecated_events_still_report_each_run_of_speech(self):
+        # The superseded events keep their old shape: one call per run of
+        # speech, four arguments, no turn number.
+        processor = AudioBufferProcessor(
+            sample_rate=TURN_SAMPLE_RATE,
+            num_channels=1,
+            enable_turn_audio=True,
+            auto_start_recording=True,
+        )
+        runs = []
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+
+            @processor.event_handler("on_user_turn_audio_data")
+            async def on_user(buffer, audio, sample_rate, num_channels):
+                runs.append(("user", bytes(audio)))
+
+        self.assertEqual(len(caught), 1)
+        self.assertIs(caught[0].category, DeprecationWarning)
+        self.assertIn("on_user_turn_audio", str(caught[0].message))
+
+        # Two runs of user speech in one turn produce two calls.
+        await run_test(
+            processor,
+            frames_to_send=[*_user_run(), *_user_run(), *_bot_run()],
+            pipeline_params=PipelineParams(
+                audio_in_sample_rate=TURN_SAMPLE_RATE, audio_out_sample_rate=TURN_SAMPLE_RATE
+            ),
+        )
+
+        self.assertEqual(runs, [("user", TURN_CHUNK), ("user", TURN_CHUNK)])
+
+    async def test_open_mic_audio_stays_out_of_the_interrupted_turn(self):
+        # The mic keeps delivering while the bot speaks, so at a barge-in the
+        # user's buffer holds the pre-roll leading into their interruption. That
+        # audio belongs to the turn starting, not the one being interrupted.
+        events = await self._turn_events(
+            [
+                *_user_run(),
+                BotStartedSpeakingFrame(),
+                SleepFrame(sleep=0.05),
+                OutputAudioRawFrame(audio=TURN_CHUNK, sample_rate=TURN_SAMPLE_RATE, num_channels=1),
+                InputAudioRawFrame(audio=TURN_CHUNK, sample_rate=TURN_SAMPLE_RATE, num_channels=1),
+                SleepFrame(sleep=0.1),
+                UserStartedSpeakingFrame(),
+                SleepFrame(sleep=0.05),
+                BotStoppedSpeakingFrame(),
+                SleepFrame(sleep=0.05),
+                InputAudioRawFrame(audio=TURN_CHUNK, sample_rate=TURN_SAMPLE_RATE, num_channels=1),
+                SleepFrame(sleep=0.05),
+                UserStoppedSpeakingFrame(),
+                SleepFrame(sleep=0.2),
+            ]
+        )
+
+        turn_1_user = next(audio for who, turn, audio in events if who == "user" and turn == 1)
+        self.assertEqual(turn_1_user, TURN_CHUNK)
+
+    async def test_reports_the_turn_in_progress_when_recording_stops(self):
+        # Stopping the recording leaves the turn open, and ending the pipeline
+        # closes it. A conversation's last turn arrives this way.
+        events = await self._turn_events(
+            [*_user_run(), *_bot_run(), AudioBufferStopRecordingFrame(), SleepFrame(sleep=0.2)]
+        )
+
+        self.assertEqual(events, [("user", 1, TURN_CHUNK), ("bot", 1, TURN_CHUNK)])
+
+
+class TestUnmixedBotTrack(unittest.IsolatedAsyncioTestCase):
+    async def test_split_track_uses_clean_audio_with_matching_padding_and_flushes(self):
+        for enabled in (False, True):
+            for buffer_size in (0, 8):
+                with self.subTest(enabled=enabled, buffer_size=buffer_size):
+                    processor = await _make_processor(
+                        buffer_size=buffer_size, use_unmixed_audio_for_bot_track=enabled
+                    )
+                    merged, users, bots = [], [], []
+
+                    @processor.event_handler("on_audio_data")
+                    async def on_audio(_, audio, rate, channels, merged=merged):
+                        merged.append(audio)
+
+                    @processor.event_handler("on_track_audio_data")
+                    async def on_tracks(_, user, bot, rate, channels, users=users, bots=bots):
+                        users.append(user)
+                        bots.append(bot)
+
+                    first = OutputAudioRawFrame(struct.pack("<hh", 101, 102), 16000, 1)
+                    first.unmixed_audio = struct.pack("<hh", 1, 2)
+                    last = OutputAudioRawFrame(struct.pack("<hh", 103, 104), 16000, 1)
+                    last.unmixed_audio = struct.pack("<hh", 3, 4)
+                    try:
+                        for frame in (
+                            InputAudioRawFrame(struct.pack("<hh", 10, 20), 16000, 1),
+                            first,
+                            InputAudioRawFrame(struct.pack("<hh", 30, 40), 16000, 1),
+                            InputAudioRawFrame(struct.pack("<hh", 50, 60), 16000, 1),
+                            last,
+                        ):
+                            await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+                        await processor.stop_recording()
+                        await processor.cleanup()
+
+                        self.assertEqual(
+                            b"".join(users), struct.pack("<6h", 10, 20, 30, 40, 50, 60)
+                        )
+                        expected = (1, 2, 0, 0, 3, 4) if enabled else (101, 102, 0, 0, 103, 104)
+                        self.assertEqual(b"".join(bots), struct.pack("<6h", *expected))
+                        # Stereo merged output keeps the ambient-containing right channel.
+                        self.assertEqual(
+                            b"".join(merged),
+                            struct.pack("<12h", 10, 101, 20, 102, 30, 0, 40, 0, 50, 103, 60, 104),
+                        )
+                        self.assertEqual(first.audio, struct.pack("<hh", 101, 102))
+                    finally:
+                        await processor.cleanup()
+
+    async def test_output_gaps_and_recording_restarts_keep_clean_track_aligned(self):
+        processor = await _make_processor(use_unmixed_audio_for_bot_track=True)
+        chunks = []
+        emitted = asyncio.Event()
+
+        @processor.event_handler("on_track_audio_data")
+        async def on_tracks(_, user, bot, rate, channels):
+            chunks.append((user, bot))
+            emitted.set()
+
+        try:
+            first = OutputAudioRawFrame(struct.pack("<h", 1100) * 160, 16000, 1)
+            first.unmixed_audio = struct.pack("<h", 100) * 160
+            await processor.process_frame(first, FrameDirection.DOWNSTREAM)
+            processor._last_bot_buffer_update_time -= 0.5
+            # Without a mixer, output PCM is itself the clean source.
+            last = OutputAudioRawFrame(struct.pack("<h", 200) * 160, 16000, 1)
+            await processor.process_frame(last, FrameDirection.DOWNSTREAM)
+            await processor.stop_recording()
+            await asyncio.wait_for(emitted.wait(), 1)
+            user, bot = chunks[-1]
+            self.assertEqual(len(user), len(bot))
+            self.assertEqual(bot[:320], first.unmixed_audio)
+            self.assertEqual(bot[-320:], last.audio)
+            self.assertGreater(len(bot[320:-320]), 0)
+            self.assertEqual(set(bot[320:-320]), {0})
+
+            emitted.clear()
+            await processor.start_recording()
+            await processor.process_frame(
+                InputAudioRawFrame(b"\x01\x00" * 160, 16000, 1), FrameDirection.DOWNSTREAM
+            )
+            await processor.stop_recording()
+            await asyncio.wait_for(emitted.wait(), 1)
+            self.assertEqual(chunks[-1], (b"\x01\x00" * 160, b"\x00\x00" * 160))
+        finally:
+            await processor.cleanup()
 
 
 if __name__ == "__main__":

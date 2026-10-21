@@ -8,23 +8,20 @@
 
 import asyncio
 import json
-import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
 from loguru import logger
 
 from pipecat.frames.frames import (
-    CancelFrame,
-    EndFrame,
     ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
+    ProposedUserStartedSpeakingFrame,
+    ProposedUserStoppedSpeakingFrame,
     StartFrame,
     STTMetadataFrame,
     TranscriptionFrame,
-    UserStartedSpeakingFrame,
-    UserStoppedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
@@ -35,8 +32,7 @@ from pipecat.services.dograh.mps_billing import (
 )
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_latency import DOGRAH_TTFS_P99
-from pipecat.services.stt_service import STTService
-from pipecat.services.websocket_service import WebsocketService
+from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.utils.time import time_now_iso8601
@@ -58,7 +54,7 @@ class DograhSTTSettings(STTSettings):
     pass
 
 
-class DograhSTTService(STTService, WebsocketService):
+class DograhSTTService(WebsocketSTTService):
     """Dograh speech-to-text service using WebSocket streaming.
 
     This service provides real-time speech recognition using Dograh's unified WebSocket API.
@@ -91,7 +87,8 @@ class DograhSTTService(STTService, WebsocketService):
             correlation_id: Optional server-generated correlation ID for MPS billing v2.
             sample_rate: Audio sample rate in Hz. Defaults to None.
             interim_results: Whether to receive interim transcription results.
-            vad_events: Whether to receive voice activity detection events.
+            vad_events: Whether to receive provider speech events and broadcast turn proposals
+                for the user aggregator to resolve.
             keyterms: Optional list of keyterms for speech recognition boosting.
             settings: STT settings including model and language.
             ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
@@ -102,14 +99,13 @@ class DograhSTTService(STTService, WebsocketService):
         if settings is not None:
             default_settings.apply_update(settings)
 
-        STTService.__init__(
-            self,
+        super().__init__(
+            reconnect_on_error=True,
             sample_rate=sample_rate,
             settings=default_settings,
             ttfs_p99_latency=ttfs_p99_latency,
             **kwargs,
         )
-        WebsocketService.__init__(self, reconnect_on_error=True, **kwargs)
 
         self._api_key = api_key
         self._base_url = base_url
@@ -120,10 +116,9 @@ class DograhSTTService(STTService, WebsocketService):
         self._keyterms = keyterms or []
 
         self._receive_task = None
-        self._keepalive_task = None
+        self._protocol_keepalive_task = None
 
         # Session tracking for metrics
-        self._session_start_time: float | None = None
         self._start_metadata = None
 
         # Register event handlers if VAD is enabled
@@ -141,19 +136,11 @@ class DograhSTTService(STTService, WebsocketService):
         return self._vad_events
 
     def service_metadata_frame(self) -> STTMetadataFrame:
-        """Recommend external turn strategies when Dograh emits VAD events."""
+        """Recommend external turn strategies to resolve provider speech proposals."""
         frame = super().service_metadata_frame()
         if self._vad_events:
             frame.user_turn_strategies = ExternalUserTurnStrategies()
         return frame
-
-    async def set_language(self, language: Language):
-        """Set the language for speech recognition.
-
-        Args:
-            language: The language to use for recognition.
-        """
-        await self._update_settings(STTSettings(language=language))
 
     def _get_correlation_id(self) -> str | None:
         return get_correlation_id(
@@ -229,8 +216,10 @@ class DograhSTTService(STTService, WebsocketService):
         if self._websocket and not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
 
-        if self._websocket and not self._keepalive_task:
-            self._keepalive_task = self.create_task(self._keepalive_task_handler())
+        if self._websocket and not self._protocol_keepalive_task:
+            self._protocol_keepalive_task = self.create_task(
+                self._protocol_keepalive_task_handler()
+            )
 
     async def _disconnect(self):
         """Disconnect from the service."""
@@ -240,19 +229,11 @@ class DograhSTTService(STTService, WebsocketService):
             await self.cancel_task(self._receive_task)
             self._receive_task = None
 
-        if self._keepalive_task:
-            await self.cancel_task(self._keepalive_task)
-            self._keepalive_task = None
+        if self._protocol_keepalive_task:
+            await self.cancel_task(self._protocol_keepalive_task)
+            self._protocol_keepalive_task = None
 
         await self._disconnect_websocket()
-
-    async def _report_error(self, frame: ErrorFrame):
-        """Report an error to the pipeline.
-
-        Args:
-            frame: The error frame to push upstream.
-        """
-        await self.push_frame(frame, FrameDirection.UPSTREAM)
 
     async def _receive_messages(self):
         """Handle incoming WebSocket messages from Dograh."""
@@ -286,12 +267,11 @@ class DograhSTTService(STTService, WebsocketService):
                     if is_quota_error:
                         logger.info(f"STT quota exceeded: {error_msg}")
 
-                        # Push the error frame to trigger pipeline shutdown
-                        await self.push_frame(
-                            ErrorFrame(
-                                error=f"STT service quota exceeded: {error_msg}", fatal=True
-                            ),
-                            direction=FrameDirection.UPSTREAM,
+                        # Mark the service unusable. Dograh workers use the
+                        # v1.8 ProcessorUnusablePolicy.CANCEL contract.
+                        await self.push_error(
+                            error_msg=f"STT service quota exceeded: {error_msg}",
+                            force_treat_as_permanent=True,
                         )
 
                         # Close the websocket gracefully
@@ -330,8 +310,13 @@ class DograhSTTService(STTService, WebsocketService):
                 logger.error(f"Error processing STT message: {e}")
                 raise
 
-    async def _keepalive_task_handler(self):
-        """Send periodic keepalive messages to maintain WebSocket connection."""
+    async def _protocol_keepalive_task_handler(self):
+        """Ping the service on a fixed interval to keep the WebSocket open.
+
+        Deliberately not the base class's ``_keepalive_task_handler``, which
+        sends silent audio only after an idle period. This one sends a protocol
+        message unconditionally, so it must not shadow the base's task.
+        """
         KEEPALIVE_SLEEP = 5
         while True:
             await asyncio.sleep(KEEPALIVE_SLEEP)
@@ -395,7 +380,6 @@ class DograhSTTService(STTService, WebsocketService):
                     )
                 )
                 await self._handle_transcription_traced(transcript, is_final, language)
-                await self.stop_processing_metrics()
             else:
                 # Interim transcription
                 await self.push_frame(
@@ -412,14 +396,13 @@ class DograhSTTService(STTService, WebsocketService):
         """Handle speech started event."""
         logger.debug("Speech started detected")
         await self.start_ttfb_metrics()
-        await self.start_processing_metrics()
-        await self.push_frame(UserStartedSpeakingFrame())
+        await self.broadcast_frame(ProposedUserStartedSpeakingFrame)
         await self._call_event_handler("on_speech_started")
 
     async def _handle_speech_ended(self, msg: dict):
         """Handle speech ended event."""
         logger.debug("Speech ended detected")
-        await self.push_frame(UserStoppedSpeakingFrame())
+        await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
         await self._call_event_handler("on_speech_ended")
 
     async def start(self, frame: StartFrame):
@@ -430,34 +413,7 @@ class DograhSTTService(STTService, WebsocketService):
         """
         await super().start(frame)
         self._start_metadata = frame.metadata
-        self._session_start_time = time.time()
         await self._connect()
-
-    async def stop(self, frame: EndFrame):
-        """Stop the STT service.
-
-        Args:
-            frame: The end frame.
-        """
-        await super().stop(frame)
-        await self._disconnect()
-        self._session_start_time = None
-
-    async def cancel(self, frame: CancelFrame):
-        """Cancel the STT service.
-
-        Args:
-            frame: The cancel frame.
-        """
-        await super().cancel(frame)
-        await self._disconnect()
-        self._session_start_time = None
-
-    async def cleanup(self):
-        """Release Dograh STT resources on every pipeline teardown path."""
-        await super().cleanup()
-        await self._disconnect()
-        self._session_start_time = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames with Dograh-specific handling.

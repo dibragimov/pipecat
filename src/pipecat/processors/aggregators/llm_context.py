@@ -18,63 +18,51 @@ import asyncio
 import base64
 import copy
 import io
-import wave
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any, TypeAlias, TypeGuard, TypeVar, cast, overload
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast, overload
 
 from loguru import logger
-from openai._types import NOT_GIVEN as OPEN_AI_NOT_GIVEN
-from openai._types import NotGiven as OpenAINotGiven
-from openai.types.chat import (
-    ChatCompletionMessageParam,
-    ChatCompletionToolChoiceOptionParam,
-)
 from PIL import Image
 
 from pipecat.adapters.schemas.direct_function import DirectFunction
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.audio.utils import pcm_to_wav
 from pipecat.frames.frames import AudioRawFrame
 
+# The sentinel is part of LLMContext's public surface — tools and tool_choice
+# default to it — so it is re-exported here for callers. The redundant aliases
+# mark that intent; a plain import would look unused and be stripped.
+from pipecat.utils.types import NOT_GIVEN as NOT_GIVEN
+from pipecat.utils.types import NotGiven as NotGiven
+from pipecat.utils.types import is_given as is_given
+
 # "Re-export" types from OpenAI that we're using as universal context types.
-# NOTE: these are aliased to OpenAI's today, but callers should treat them as
-# LLMContext's own types — independent definitions that happen to coincide
-# with OpenAI's as an implementation detail. If universal context types need
-# to someday diverge from OpenAI's, we should consider managing our own
+# NOTE: these are aliased to OpenAI's for type checking, but callers should
+# treat them as LLMContext's own types — independent definitions that happen to
+# coincide with OpenAI's as an implementation detail. If universal context types
+# need to someday diverge from OpenAI's, we should consider managing our own
 # definitions (but with care, since OpenAI's types are somewhat of a standard
 # and we want to continue supporting them). In the meantime, code at the
 # LLMContext/OpenAI boundary should use explicit casts rather than rely on
 # the aliasing.
-LLMStandardMessage: TypeAlias = ChatCompletionMessageParam
-LLMContextToolChoice: TypeAlias = ChatCompletionToolChoiceOptionParam
-NOT_GIVEN = OPEN_AI_NOT_GIVEN
-NotGiven: TypeAlias = OpenAINotGiven
+#
+# The aliases resolve under type checking only. Every LLM service reaches this
+# module, so importing the OpenAI SDK here would put its load on the startup
+# path of pipelines that never talk to OpenAI. At runtime both are structurally
+# dicts or strings, which is all the annotations need them to be.
+if TYPE_CHECKING:
+    from openai.types.chat import (
+        ChatCompletionMessageParam,
+        ChatCompletionToolChoiceOptionParam,
+    )
 
-
-_T = TypeVar("_T")
-
-
-def is_given(value: _T | NotGiven) -> TypeGuard[_T]:
-    """Check whether a value was explicitly provided.
-
-    Typically used when checking whether a ``NotGiven``-valued field or
-    parameter was set::
-
-        if is_given(context.tools):
-            ...
-
-    Also acts as a type guard: inside a true branch, the value is narrowed
-    to exclude ``NotGiven`` (e.g. ``ToolsSchema | NotGiven`` becomes
-    ``ToolsSchema``).
-
-    Args:
-        value: The value to check.
-
-    Returns:
-        ``True`` if *value* is anything other than ``NOT_GIVEN``.
-    """
-    return not isinstance(value, NotGiven)
+    LLMStandardMessage: TypeAlias = ChatCompletionMessageParam
+    LLMContextToolChoice: TypeAlias = ChatCompletionToolChoiceOptionParam
+else:
+    LLMStandardMessage: TypeAlias = Any
+    LLMContextToolChoice: TypeAlias = Any
 
 
 @dataclass
@@ -83,10 +71,17 @@ class LLMSpecificMessage:
 
     Enables the use of service-specific message types while maintaining
     compatibility with the universal LLM context format.
+
+    Parameters:
+        llm: Identifier of the LLM adapter that understands this message.
+        message: Provider-specific content.
+        is_metadata: Auxiliary data that is quietly omitted for other LLMs
+            without losing conversation content. The owning LLM still receives it.
     """
 
     llm: str
     message: Any
+    is_metadata: bool = field(default=False, kw_only=True)
 
 
 LLMContextMessage: TypeAlias = LLMStandardMessage | LLMSpecificMessage
@@ -105,7 +100,6 @@ class LLMContext:
         messages: list[LLMContextMessage] | None = None,
         tools: ToolsSchema | list[FunctionSchema | DirectFunction] | NotGiven = NOT_GIVEN,
         tool_choice: LLMContextToolChoice | NotGiven = NOT_GIVEN,
-        skip_set_tools_frame: bool = False,
     ):
         """Initialize the LLM context.
 
@@ -119,9 +113,6 @@ class LLMContext:
                 the LLM service automatically, so no separate
                 ``register_function`` call is needed.
             tool_choice: Tool selection strategy for the LLM.
-            skip_set_tools_frame: If True, LLMSetToolsFrame will not update
-                tools on this context. Useful for classifier contexts (e.g.
-                voicemail detector) that should not inherit pipeline tools.
         """
         self._messages: list[LLMContextMessage] = messages if messages else []
         self._tools: ToolsSchema | NotGiven = LLMContext._normalize_and_validate_tools(tools)
@@ -130,9 +121,6 @@ class LLMContext:
         # Name of the current OTel span. This is useful for downstream tracing
         # where we want to include the span name in the span.
         self._otel_span_name = ""
-
-        # For context instances which should not take tools, like voicemail detector
-        self._skip_set_tools_frame = skip_set_tools_frame
 
     @staticmethod
     def create_image_url_message(
@@ -214,15 +202,8 @@ class LLMContext:
 
             data = b"".join(frame.audio for frame in audio_frames)
 
-            with io.BytesIO() as buffer:
-                with wave.open(buffer, "wb") as wf:
-                    wf.setsampwidth(2)
-                    wf.setnchannels(num_channels)
-                    wf.setframerate(sample_rate)
-                    wf.writeframes(data)
-
-                encoded_audio = base64.b64encode(buffer.getvalue()).decode("utf-8")
-            return encoded_audio
+            wav = pcm_to_wav(data, sample_rate, num_channels)
+            return base64.b64encode(wav).decode("utf-8")
 
         encoded_audio = await asyncio.to_thread(encode_audio)
 
@@ -259,9 +240,9 @@ class LLMContext:
         Args:
             llm_specific_filter: Optional filter to return LLM-specific
                 messages for the given LLM, in addition to the standard
-                messages. If messages end up being filtered, an error will be
-                logged; this is intended to catch accidental use of
-                incompatible LLM-specific messages.
+                messages. Other LLMs' metadata is quietly omitted; filtering
+                incompatible conversation content logs an error. The stored
+                history is never changed.
             truncate_large_values: If True, return deep copies of messages with
                 large values shortened. For standard messages, known binary
                 data (base64-encoded images, audio) is replaced with short
@@ -279,7 +260,12 @@ class LLMContext:
                 for msg in self._messages
                 if not isinstance(msg, LLMSpecificMessage) or msg.llm == llm_specific_filter
             ]
-            if len(messages) < len(self._messages):
+            if any(
+                isinstance(msg, LLMSpecificMessage)
+                and msg.llm != llm_specific_filter
+                and not msg.is_metadata
+                for msg in self._messages
+            ):
                 logger.error(
                     f"Attempted to use incompatible LLMSpecificMessages with LLM '{llm_specific_filter}'."
                 )
@@ -433,8 +419,6 @@ class LLMContext:
             tools: A ToolsSchema, a plain list of direct functions and/or
                 ``FunctionSchema`` objects, or NOT_GIVEN to disable tools.
         """
-        if self._skip_set_tools_frame:
-            return
         self._tools = LLMContext._normalize_and_validate_tools(tools)
 
     def set_tool_choice(self, tool_choice: LLMContextToolChoice | NotGiven):
@@ -485,6 +469,8 @@ class LLMContext:
     @staticmethod
     def _normalize_and_validate_tools(
         tools: ToolsSchema | list[FunctionSchema | DirectFunction] | NotGiven,
+        *,
+        allow_provider_tools: Literal[False] = False,
     ) -> ToolsSchema | NotGiven: ...
 
     @overload
@@ -492,7 +478,7 @@ class LLMContext:
     def _normalize_and_validate_tools(
         tools: ToolsSchema | list[Any] | NotGiven,
         *,
-        allow_provider_tools: bool,
+        allow_provider_tools: Literal[True],
     ) -> ToolsSchema | list[Any] | NotGiven: ...
 
     @staticmethod

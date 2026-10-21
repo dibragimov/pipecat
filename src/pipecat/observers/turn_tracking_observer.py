@@ -11,6 +11,7 @@ tracking when turns start and end based on user and bot speech patterns.
 """
 
 import asyncio
+import warnings
 from collections import deque
 
 from loguru import logger
@@ -20,6 +21,7 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     CancelFrame,
     EndFrame,
+    InterruptionFrame,
     StartFrame,
     UserMuteStartedFrame,
     UserMuteStoppedFrame,
@@ -49,19 +51,35 @@ class TurnTrackingObserver(BaseObserver):
     strategies suppress them at the user aggregator, so speech detected during
     a mute window (e.g. echo of the bot's own audio) must not advance turns or
     report user speech timing.
+
+    Events:
+
+    - on_turn_started: Triggered when a turn starts, providing the turn number
+    - on_turn_ended: Triggered when a turn ends, providing the turn number, the turn's
+      duration in seconds, and whether it was interrupted
     """
 
-    def __init__(self, max_frames=100, turn_end_timeout_secs=2.5, **kwargs):
+    def __init__(self, max_frames: int | None = None, turn_end_timeout_secs: float = 2.5, **kwargs):
         """Initialize the turn tracking observer.
 
         Args:
-            max_frames: Maximum number of frame IDs to keep in history for
-                duplicate detection. Defaults to 100.
+            max_frames: Unused.
+
+                .. deprecated:: 1.12.0
+                    No replacement. The observer receives each frame once.
+                    Will be removed in 2.0.0.
             turn_end_timeout_secs: Timeout in seconds after bot stops speaking
                 before automatically ending the turn. Defaults to 2.5.
             **kwargs: Additional arguments passed to the parent observer.
         """
-        super().__init__(**kwargs)
+        if max_frames is not None:
+            warnings.warn(
+                "`max_frames` parameter of `TurnTrackingObserver` is deprecated since 1.12.0 "
+                "and will be removed in 2.0.0. No replacement.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        super().__init__(observe_every_push=False, **kwargs)
         self._turn_count = 0
         self._is_turn_active = False
         self._is_bot_speaking = False
@@ -77,9 +95,8 @@ class TurnTrackingObserver(BaseObserver):
         self._turn_end_timeout_secs = turn_end_timeout_secs
         self._end_turn_timer = None
 
-        # Track processed frames to avoid duplicates
-        self._processed_frames = set()
-        self._frame_history = deque(maxlen=max_frames)
+        # WorkerObserver deduplicates pushes; broadcast siblings are distinct frames.
+        self._broadcast_sibling_ids = deque(maxlen=100)
 
         # These handlers run inside this observer's worker task, so awaiting
         # them preserves the exact frame order without blocking the pipeline.
@@ -96,26 +113,11 @@ class TurnTrackingObserver(BaseObserver):
         Args:
             data: Frame push event data containing the frame and metadata.
         """
-        # A broadcast creates distinct upstream/downstream frame instances that
-        # represent one logical event. Use their shared minimum ID so whichever
-        # sibling arrives first owns processing and the other is ignored.
-        frame_key = min(
-            data.frame.id,
-            data.frame.broadcast_sibling_id or data.frame.id,
-        )
-
-        # Skip already processed frames and broadcast siblings.
-        if frame_key in self._processed_frames:
-            return
-
-        self._processed_frames.add(frame_key)
-        self._frame_history.append(frame_key)
-
-        # If we've exceeded our history size, remove the oldest frame ID
-        # from the set of processed frames.
-        if len(self._processed_frames) > len(self._frame_history):
-            # Rebuild the set from the current deque contents
-            self._processed_frames = set(self._frame_history)
+        sibling_id = data.frame.broadcast_sibling_id
+        if sibling_id is not None:
+            if data.frame.id in self._broadcast_sibling_ids:
+                return
+            self._broadcast_sibling_ids.append(sibling_id)
 
         if isinstance(data.frame, StartFrame):
             # Start the first turn immediately when the pipeline starts
@@ -129,6 +131,11 @@ class TurnTrackingObserver(BaseObserver):
             await self._handle_user_started_speaking(data)
         elif isinstance(data.frame, UserStoppedSpeakingFrame):
             await self._handle_user_stopped_speaking(data)
+        elif isinstance(data.frame, InterruptionFrame) and self._is_bot_speaking:
+            # Word thresholds can interrupt after a non-interrupting speech onset.
+            self._cancel_turn_end_timer()
+            await self._end_turn(data, was_interrupted=True)
+            self._is_bot_speaking = False
         elif isinstance(data.frame, BotStartedSpeakingFrame):
             await self._handle_bot_started_speaking(data)
         # A BotStoppedSpeakingFrame can arrive after UserStartedSpeakingFrame
@@ -162,23 +169,24 @@ class TurnTrackingObserver(BaseObserver):
 
     async def _end_turn_after_timeout(self, data: FramePushed):
         """End turn after timeout has expired."""
-        if self._is_turn_active and not self._is_bot_speaking:
+        if self._is_turn_active and not self._is_bot_speaking and self._user_speaking_turn is None:
             logger.trace(f"Turn {self._turn_count} ending due to timeout")
             await self._end_turn(data, was_interrupted=False)
             self._end_turn_timer = None
 
     async def _handle_user_started_speaking(self, data: FramePushed):
         """Handle user speaking events, including interruptions."""
+        assert isinstance(data.frame, UserStartedSpeakingFrame)
         if self._is_user_muted:
             logger.trace(f"Ignoring muted user speech start in Turn {self._turn_count}")
             return
 
         if self._is_bot_speaking:
-            # Handle interruption - end current turn and start a new one
-            self._cancel_turn_end_timer()  # Cancel any pending end turn timer
-            await self._end_turn(data, was_interrupted=True)
-            self._is_bot_speaking = False  # Bot is considered interrupted
-            await self._start_turn(data)
+            self._cancel_turn_end_timer()
+            if data.frame.enable_interruptions:
+                await self._end_turn(data, was_interrupted=True)
+                self._is_bot_speaking = False
+                await self._start_turn(data)
         elif self._is_turn_active and self._has_bot_spoken:
             # User started speaking during the turn_end_timeout_secs period after bot speech
             self._cancel_turn_end_timer()  # Cancel any pending end turn timer
@@ -208,9 +216,13 @@ class TurnTrackingObserver(BaseObserver):
         turn_number = self._user_speaking_turn or self._turn_count
         await self._call_event_handler("on_user_speech_stopped_for_turn", turn_number, data)
         self._user_speaking_turn = None
+        if self._has_bot_spoken and not self._is_bot_speaking:
+            self._schedule_turn_end(data)
 
     async def _handle_bot_started_speaking(self, data: FramePushed):
         """Handle bot speaking events."""
+        if not self._is_turn_active:
+            await self._start_turn(data)
         self._is_bot_speaking = True
         self._bot_speaking_turn = self._turn_count
         self._has_bot_spoken = True
@@ -228,7 +240,11 @@ class TurnTrackingObserver(BaseObserver):
         # Only schedule the current logical turn to end. An interrupted bot's
         # physical stop can arrive after the next turn has already started and
         # must not schedule that new turn for completion.
-        if self._is_turn_active and turn_number == self._turn_count:
+        if (
+            self._is_turn_active
+            and turn_number == self._turn_count
+            and self._user_speaking_turn is None
+        ):
             # This delay handles cases where bot speech resumes within the same
             # turn, for example HTTP TTS services or function calls.
             self._schedule_turn_end(data)
