@@ -207,7 +207,8 @@ class YandexSTTService(STTService):
         except grpc.aio.AioRpcError as e:
             logger.error(f"{self}: Yandex STT stream error: {e.code()} {e.details()}")
             await self._call_event_handler("on_connection_error", str(e))
-            await self.push_error(ErrorFrame(f"Yandex STT error: {e.details()}"))
+            # push_error takes the message string (it builds the ErrorFrame itself)
+            await self.push_error(f"Yandex STT error: {e.details()}")
         except asyncio.CancelledError:
             pass
 
